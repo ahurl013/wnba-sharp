@@ -106,7 +106,7 @@ const store = {
     try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* quota */ }
   },
 };
-const K_GAMES = "wnba26-games-v1";
+const K_GAMES = "wnba26-games-v2";
 const K_LOG = "wnba26-betlog-v1";
 const K_GL = "wnba26-gamelogs-v1";
 
@@ -130,6 +130,13 @@ async function pool(items, limit, fn, onProg) {
   return out;
 }
 const ymd = (dt) => dt.toISOString().slice(0, 10).replace(/-/g, "");
+const ymdET = (iso) => new Date(iso).toLocaleDateString("en-CA", { timeZone: "America/New_York" }).replace(/-/g, "");
+const todayET = () => new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" }).replace(/-/g, "");
+const addDaysYmd = (y, n) => {
+  const d = new Date(Date.UTC(+y.slice(0, 4), +y.slice(4, 6) - 1, +y.slice(6, 8)));
+  d.setUTCDate(d.getUTCDate() + n);
+  return ymd(d);
+};
 function dateRange(fromYmd, toYmd) {
   const out = [];
   const d = new Date(`${fromYmd.slice(0, 4)}-${fromYmd.slice(4, 6)}-${fromYmd.slice(6, 8)}T12:00:00Z`);
@@ -144,7 +151,8 @@ function parseScoreboardEvent(ev) {
   const home = c.competitors.find((x) => x.homeAway === "home");
   const away = c.competitors.find((x) => x.homeAway === "away");
   if (!home || !away) return null;
-  const o = (c.odds && c.odds[0]) || null;
+  const oddsArr = c.odds || [];
+  const o = oddsArr.find((x) => x.overUnder != null || x.spread != null || x.homeTeamOdds) || oddsArr[0] || null;
   let spread = null, total = null, mlH = null, mlA = null, spH = null, spA = null, totO = null, totU = null;
   if (o) {
     if (typeof o.spread === "number") spread = o.spread;
@@ -165,13 +173,19 @@ function parseScoreboardEvent(ev) {
   return {
     id: ev.id,
     date: ev.date,
+    d: ymdET(ev.date),
+    seasonType: ev.season?.type ?? null,
+    name: ev.name || ev.shortName || "",
     state: ev.status?.type?.state || "pre",
+    statusTxt: ev.status?.type?.shortDetail || "",
     completed: !!ev.status?.type?.completed,
     home: { id: home.team.id, ab: home.team.abbreviation, name: home.team.shortDisplayName || home.team.displayName, pts: home.score != null ? +home.score : null },
     away: { id: away.team.id, ab: away.team.abbreviation, name: away.team.shortDisplayName || away.team.displayName, pts: away.score != null ? +away.score : null },
     odds: o ? { spread, total, mlH, mlA, spH, spA, totO, totU, provider: o.provider?.name || null } : null,
   };
 }
+// regular season + playoffs only — preseason and All-Star never touch the model
+const isModelGame = (pe) => pe && pe.seasonType !== 1 && !/all-star/i.test(pe.name);
 function statVal(stats, name) {
   const s = stats.find((x) => x.name === name);
   return s ? s.displayValue : null;
@@ -598,15 +612,22 @@ function PropsPanel({ game, ratings, gamelogCache, setGamelogCache, injuries }) 
 }
 
 /* ---------------- ratings table ---------------- */
-function RatingsTab({ ratings }) {
+function RatingsTab({ ratings, games }) {
   if (!ratings) return <div style={{ color: C.faint, fontSize: 13 }}>No ratings yet — run sync.</div>;
+  const withBox = games.filter((g) => g.hPoss != null && g.aPoss != null).length;
+  const first = games.length ? (games[0].d || ymdET(games[0].date)) : null;
+  const lastG = games.length ? (games[games.length - 1].d || ymdET(games[games.length - 1].date)) : null;
+  const fd = (y) => y ? `${y.slice(4, 6)}/${y.slice(6, 8)}` : "—";
   const rows = Object.keys(ratings.teams)
     .map((id) => ({ id, ab: ratings.teams[id], o: ratings.adjO[id], d: ratings.adjD[id], p: ratings.pace[id], n: ratings.gp[id], net: ratings.adjO[id] - ratings.adjD[id] }))
     .sort((a, b) => b.net - a.net);
   return (
     <div style={sCard}>
-      <div style={{ fontSize: 11, color: C.dim, marginBottom: 8, fontFamily: C.mono }}>
+      <div style={{ fontSize: 11, color: C.dim, marginBottom: 4, fontFamily: C.mono }}>
         {ratings.nGames} games w/ box · lg eff {ratings.lg.toFixed(1)} · lg pace {ratings.lgPace.toFixed(1)} · HCA {ratings.hca.toFixed(1)} pts · regressed n/(n+6)
+      </div>
+      <div style={{ fontSize: 11, marginBottom: 8, fontFamily: C.mono, color: withBox === games.length ? C.plus : C.warn }}>
+        audit: {games.length} finals cached ({fd(first)}–{fd(lastG)}) · box parsed {withBox}/{games.length}{withBox < games.length ? " — missing boxes auto-retry next sync" : " ✓"}
       </div>
       <table style={{ width: "100%", borderCollapse: "collapse" }}>
         <thead><tr><th style={{ ...sTh, textAlign: "left" }}>team</th><th style={sTh}>adjO</th><th style={sTh}>adjD</th><th style={sTh}>net</th><th style={sTh}>pace</th><th style={sTh}>gp</th></tr></thead>
@@ -639,7 +660,7 @@ function LogTab({ log, setLog }) {
   const upd = (id, patch) => setLog((L) => L.map((b) => (b.id === id ? { ...b, ...patch } : b)));
   const settle = async (b) => {
     try {
-      const d = ymd(new Date(b.gameDate));
+      const d = ymdET(b.gameDate);
       const j = await fjson(SB_URL(d));
       const ev = (j.events || []).find((e) => e.id === b.eventId);
       const pe = ev && parseScoreboardEvent(ev);
@@ -703,12 +724,20 @@ function App() {
   const [games, setGames] = useState([]); // completed cache
   const [slate, setSlate] = useState([]);
   const [ratings, setRatings] = useState(null);
-  const [sims, setSims] = useState({});
+  const [lines, setLines] = useState(null);
+  const [live, setLive] = useState(false);
   const [sync, setSync] = useState({ busy: false, msg: "", last: null, err: null });
   const [log, setLogState] = useState([]);
   const [glCache, setGlCache] = useState({});
   const [injuries, setInjuries] = useState({});
   const [propsGame, setPropsGame] = useState(null);
+
+  const sims = useMemo(() => {
+    if (!ratings) return {};
+    const m = {};
+    for (const g of slate) { const s = simGame(ratings, g.home.id, g.away.id); if (s) m[g.id] = s; }
+    return m;
+  }, [slate, ratings]);
 
   const setLog = (fn) => setLogState((L) => { const n = typeof fn === "function" ? fn(L) : fn; store.set(K_LOG, n); return n; });
 
@@ -722,46 +751,51 @@ function App() {
   }, []);
 
   const runSync = useCallback(async () => {
-    setSync({ busy: true, msg: "scoreboards…", last: null, err: null });
+    setSync({ busy: true, msg: "calendar…", last: null, err: null });
     try {
       const cached = (await store.get(K_GAMES)) || { games: [], lastDate: null };
-      const today = ymd(new Date());
+      const today = todayET();
+      const tomorrow = addDaysYmd(today, 1);
       const from = cached.lastDate ? cached.lastDate : SEASON_START.replace(/-/g, "");
-      const dates = dateRange(from, today);
+      // ESPN's own league calendar drives the date list — no missed game dates, no wasted calls
+      const probe = await fjson(SB_URL(today));
+      const cal = (probe.leagues?.[0]?.calendar || [])
+        .map((c) => ymdET(typeof c === "string" ? c : c.startDate || c))
+        .filter((d) => d >= from && d <= tomorrow);
+      const dates = [...new Set([...(cal.length ? cal : dateRange(from, today)), today, tomorrow])].sort();
       const sbs = await pool(dates, 6, (d) => fjson(SB_URL(d)), (d, t) => setSync((s) => ({ ...s, msg: `scoreboards ${d}/${t}` })));
+      const failed = sbs.filter((x) => x == null).length;
       const byId = Object.fromEntries(cached.games.map((g) => [g.id, g]));
-      const todaySlate = [];
-      const newCompleted = [];
+      const slateEvts = {};
+      const needBox = [];
       for (let i = 0; i < sbs.length; i++) {
         for (const ev of sbs[i]?.events || []) {
           const pe = parseScoreboardEvent(ev);
-          if (!pe) continue;
-          if (dates[i] === today && !pe.completed) todaySlate.push(pe);
-          if (pe.completed && !byId[pe.id]) newCompleted.push(pe);
+          if (!isModelGame(pe)) continue;
+          if (pe.d >= today) slateEvts[pe.id] = pe;
+          // fetch box for new finals AND retry any cached game whose box never parsed
+          const existing = byId[pe.id];
+          if (pe.completed && (!existing || existing.hPoss == null || existing.aPoss == null)) needBox.push(pe);
         }
       }
-      setSync((s) => ({ ...s, msg: `box scores 0/${newCompleted.length}` }));
-      const sums = await pool(newCompleted, 5, (g) => fjson(SUM_URL(g.id)), (d, t) => setSync((s) => ({ ...s, msg: `box scores ${d}/${t}` })));
-      newCompleted.forEach((g, i) => {
+      setSync((s) => ({ ...s, msg: `box scores 0/${needBox.length}` }));
+      const sums = await pool(needBox, 5, (g) => fjson(SUM_URL(g.id)), (d, t) => setSync((s) => ({ ...s, msg: `box scores ${d}/${t}` })));
+      needBox.forEach((g, i) => {
         let hPoss = null, aPoss = null;
         const bt = sums[i]?.boxscore?.teams;
         if (bt) for (const t of bt) {
           const poss = teamPossFromBox(t.statistics || []);
           if (String(t.team.id) === String(g.home.id)) hPoss = poss; else aPoss = poss;
         }
-        byId[g.id] = { id: g.id, date: g.date, hId: g.home.id, hAb: g.home.ab, hPts: g.home.pts, aId: g.away.id, aAb: g.away.ab, aPts: g.away.pts, hPoss, aPoss };
+        byId[g.id] = { id: g.id, date: g.date, d: g.d, hId: g.home.id, hAb: g.home.ab, hPts: g.home.pts, aId: g.away.id, aAb: g.away.ab, aPts: g.away.pts, hPoss, aPoss };
       });
       const allGames = Object.values(byId).sort((a, b) => a.date.localeCompare(b.date));
-      await store.set(K_GAMES, { games: allGames, lastDate: today });
+      // lastDate = today (not tomorrow) so tonight's finals are re-checked on the next sync
+      if (failed === 0) await store.set(K_GAMES, { games: allGames, lastDate: today });
       setGames(allGames);
-      const rt = buildRatings(allGames);
-      setRatings(rt);
-      setSlate(todaySlate);
-      if (rt) {
-        const sm = {};
-        for (const g of todaySlate) { const s = simGame(rt, g.home.id, g.away.id); if (s) sm[g.id] = s; }
-        setSims(sm);
-      }
+      setRatings(buildRatings(allGames));
+      setSlate(Object.values(slateEvts).sort((a, b) => a.date.localeCompare(b.date)));
+      setLines(new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
       try {
         const ij = await fjson(INJ_URL);
         const map = {};
@@ -770,11 +804,36 @@ function App() {
         }
         setInjuries(map);
       } catch (e) { /* injury feed optional */ }
-      setSync({ busy: false, msg: "", last: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }), err: null });
+      setSync({
+        busy: false, msg: "",
+        last: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+        err: failed > 0 ? `${failed} scoreboard date(s) failed to load — cache checkpoint NOT advanced, so nothing is silently missing. Sync again.` : null,
+      });
     } catch (e) {
-      setSync({ busy: false, msg: "", last: null, err: "Sync failed — ESPN feed unreachable from this environment. No estimated data was substituted." });
+      setSync({ busy: false, msg: "", last: null, err: "Sync failed — ESPN feed unreachable. No estimated data was substituted." });
     }
   }, []);
+
+  // lightweight line refresh: re-pulls today + tomorrow scoreboards only (2 calls)
+  const refreshLines = useCallback(async () => {
+    try {
+      const t = todayET(), tm = addDaysYmd(t, 1);
+      const sbs = await Promise.all([fjson(SB_URL(t)), fjson(SB_URL(tm))]);
+      const evts = {};
+      for (const sb of sbs) for (const ev of sb.events || []) {
+        const pe = parseScoreboardEvent(ev);
+        if (isModelGame(pe) && pe.d >= t) evts[pe.id] = pe;
+      }
+      setSlate(Object.values(evts).sort((a, b) => a.date.localeCompare(b.date)));
+      setLines(new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" }));
+    } catch (e) { /* keep last known lines */ }
+  }, []);
+
+  useEffect(() => {
+    if (!live) return;
+    const id = setInterval(() => { if (document.visibilityState === "visible") refreshLines(); }, 90000);
+    return () => clearInterval(id);
+  }, [live, refreshLines]);
 
   const addBet = (b) => {
     const stake = b.fairP != null && b.odds != null ? Math.max(0.25, Math.round((kellyQ(b.fairP, b.odds) || 1) * 4) / 4) : 1;
@@ -816,14 +875,33 @@ function App() {
                 </div>
               </div>
             )}
-            {slate.length === 0 && games.length > 0 && !sync.busy && <div style={{ color: C.faint, fontSize: 13 }}>No games on today's slate (or sync again after lines post).</div>}
-            {slate.map((g) => (
-              <GameCard key={g.id} g={g} sim={sims[g.id]} ratings={ratings} onLogBet={addBet}
-                onOpenProps={(gm) => { setPropsGame(gm); setTab("props"); }} />
+            {slate.length === 0 && games.length > 0 && !sync.busy && <div style={{ color: C.faint, fontSize: 13 }}>No games today or tomorrow per ESPN's league calendar.</div>}
+            {slate.length > 0 && (
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                <span style={{ fontSize: 10, color: C.faint, fontFamily: C.mono }}>{lines ? `lines as of ${lines}` : ""}</span>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <Btn small onClick={refreshLines}>refresh lines</Btn>
+                  <Btn small kind={live ? "primary" : "ghost"} onClick={() => setLive(!live)}>{live ? "live: on" : "live: off"}</Btn>
+                </div>
+              </div>
+            )}
+            {[["TODAY", slate.filter((g) => g.d === todayET())], ["TOMORROW", slate.filter((g) => g.d > todayET())]].map(([lbl, gs]) => gs.length > 0 && (
+              <div key={lbl}>
+                <div style={{ fontSize: 10, color: C.accent, letterSpacing: ".1em", fontWeight: 700, margin: "10px 0 6px" }}>{lbl} · {gs.length} GAME{gs.length > 1 ? "S" : ""}</div>
+                {gs.map((g) => g.state !== "pre" ? (
+                  <div key={g.id} style={{ ...sCard, padding: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: 13, fontWeight: 700 }}>{g.away.ab} {g.away.pts ?? ""} — {g.home.pts ?? ""} {g.home.ab}</span>
+                    <span style={{ fontFamily: C.mono, fontSize: 11, color: g.completed ? C.dim : C.plus, fontWeight: 700 }}>{g.completed ? "FINAL" : `LIVE · ${g.statusTxt}`}</span>
+                  </div>
+                ) : (
+                  <GameCard key={g.id} g={g} sim={sims[g.id]} ratings={ratings} onLogBet={addBet}
+                    onOpenProps={(gm) => { setPropsGame(gm); setTab("props"); }} />
+                ))}
+              </div>
             ))}
           </div>
         )}
-        {tab === "ratings" && <RatingsTab ratings={ratings} />}
+        {tab === "ratings" && <RatingsTab ratings={ratings} games={games} />}
         {tab === "props" && (
           propsGame ? (
             <div>
