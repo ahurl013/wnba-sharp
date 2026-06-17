@@ -1,0 +1,1805 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" /><meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>WNBA Sharp 2026 · build 25</title>
+<style>html,body{margin:0;padding:0;background:#0d1117;}*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;}::-webkit-scrollbar{height:4px;width:4px;}::-webkit-scrollbar-thumb{background:#26303f;border-radius:2px;}input,button{font-family:inherit;}#boot{color:#5b6678;font:13px -apple-system,system-ui,sans-serif;padding:40px 20px;text-align:center;}</style>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+</head><body><div id="root"><div id="boot">loading engine… (build 25)</div></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+/* ============================================================
+   WNBA SHARP — game model + prop model, real data only
+   Data: ESPN public WNBA API (no keys). Anything unconfirmed = null.
+   Game model: opponent-adjusted per-100 efficiency + pace (iterative),
+   regressed to league mean, bivariate-normal Monte Carlo (10k).
+   Prop model: per-minute rates from real game logs, minutes blend,
+   opponent-defense + pace adjustments, normal / Poisson distributions.
+   Devig: exact multiplicative. Sizing: quarter Kelly.
+   ============================================================ */
+
+const SEASON = 2026;
+const SEASON_START = "2026-05-01"; // scan window start; empty dates are skipped
+const BASE = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba";
+const WEB = "https://site.web.api.espn.com/apis/common/v3/sports/basketball/wnba";
+const SB_URL = (d) => `${BASE}/scoreboard?dates=${d}`;
+const SUM_URL = (id) => `${BASE}/summary?event=${id}`;
+const ROSTER_URL = (tid) => `${BASE}/teams/${tid}/roster`;
+const INJ_URL = `${BASE}/injuries`;
+const GL_URL = (aid) => `${WEB}/athletes/${aid}/gamelog?season=${SEASON}`;
+const CORE = "https://sports.core.api.espn.com/v2/sports/basketball/leagues/wnba";
+const ODDS_URL = (eid) => `${CORE}/events/${eid}/competitions/${eid}/odds`;
+
+/* ---------------- math / odds helpers ---------------- */
+const a2d = (a) => (a >= 100 ? 1 + a / 100 : a <= -100 ? 1 + 100 / -a : NaN);
+const p2a = (p) =>
+  p <= 0 || p >= 1 ? null : p >= 0.5 ? Math.round((-100 * p) / (1 - p)) : Math.round((100 * (1 - p)) / p);
+const fmtA = (a) => (a == null || isNaN(a) ? "—" : a > 0 ? `+${a}` : `${a}`);
+const devig2 = (aA, aB) => {
+  const dA = a2d(aA), dB = a2d(aB);
+  if (isNaN(dA) || isNaN(dB)) return [null, null];
+  const iA = 1 / dA, iB = 1 / dB, s = iA + iB;
+  return [iA / s, iB / s]; // exact multiplicative
+};
+const evPct = (p, amer) => {
+  const d = a2d(amer);
+  return isNaN(d) || p == null ? null : (p * d - 1) * 100;
+};
+const kellyQ = (p, amer) => {
+  const d = a2d(amer);
+  if (isNaN(d) || p == null) return null;
+  const b = d - 1, f = (p * b - (1 - p)) / b;
+  return Math.max(0, f / 4) * 100; // % of bankroll, quarter Kelly
+};
+const normCdf = (z) => {
+  const t = 1 / (1 + 0.2316419 * Math.abs(z));
+  const dnorm = Math.exp(-z * z / 2) / Math.sqrt(2 * Math.PI);
+  const poly = t * (0.31938153 + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))));
+  const p = 1 - dnorm * poly;
+  return z >= 0 ? p : 1 - p;
+};
+const pOverNormal = (line, mu, sd) => 1 - normCdf((line - mu) / sd);
+const poisCdf = (k, lam) => {
+  let s = 0, term = Math.exp(-lam);
+  for (let i = 0; i <= k; i++) { s += term; term *= lam / (i + 1); }
+  return s;
+};
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hashStr(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
+}
+let _rng = Math.random; // simGame swaps in a seeded generator for determinism
+let _spare = null;
+const randn = () => {
+  if (_spare != null) { const v = _spare; _spare = null; return v; }
+  let u = 0, v = 0;
+  while (u === 0) u = _rng();
+  while (v === 0) v = _rng();
+  const m = Math.sqrt(-2 * Math.log(u)), a = 2 * Math.PI * v;
+  _spare = m * Math.sin(a);
+  return m * Math.cos(a);
+};
+const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
+// normalize names for injury matching (accents, punctuation, Jr/Sr/III suffixes)
+const normName = (s) => (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[.'`’\-]/g, "").replace(/\b(jr|sr|ii|iii|iv|v)\b/g, "").replace(/\s+/g, " ").trim();
+// normalize varied injury status text to the model's vocabulary
+const normStatus = (s) => {
+  const t = (s || "").toLowerCase();
+  if (/season|out\b|inactive/.test(t)) return "out";
+  if (/doubt/.test(t)) return "doubtful";
+  if (/quest|game.?time|gtd|day.?to.?day/.test(t)) return "questionable";
+  if (/prob/.test(t)) return "probable";
+  return t || "listed";
+};
+// tolerant parser for SportRadar league/injuries.json (schema-defensive)
+function parseSRInjuries(json) {
+  const map = {};
+  const teams = json.teams || json.league?.teams || json.injuries || [];
+  for (const t of teams) {
+    const players = t.players || t.team?.players || [];
+    for (const p of players) {
+      const nm = p.full_name || p.name || `${p.first_name || ""} ${p.last_name || ""}`.trim();
+      const injs = p.injuries || (p.injury ? [p.injury] : []);
+      if (!nm || !injs.length) continue;
+      const raw = injs[0].status || injs[0].desc || injs[0].comment || "listed";
+      map[normName(nm)] = { status: normStatus(raw), note: injs[0].desc || injs[0].comment || "", src: "SR", raw };
+    }
+  }
+  return map;
+}
+const mean = (a) => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : null);
+const sdOf = (a) => {
+  if (a.length < 2) return null;
+  const m = mean(a);
+  return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / (a.length - 1));
+};
+const f1 = (x) => (x == null || isNaN(x) ? "—" : x.toFixed(1));
+const pct = (p) => (p == null ? "—" : (p * 100).toFixed(1) + "%");
+
+/* ---------------- persistent storage (window.storage) ---------------- */
+const store = {
+  async get(k) {
+    try { const r = localStorage.getItem(k); return r != null ? JSON.parse(r) : null; } catch (e) { return null; }
+  },
+  async set(k, v) {
+    try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* quota */ }
+  },
+};
+const K_GAMES = "wnba26-games-v2";
+const K_LOG = "wnba26-betlog-v1";
+const K_GL = "wnba26-gamelogs-v2";
+const K_ROSTERS = "wnba26-rosters-v1";
+const K_LEDGER = "wnba26-ledger-v1";
+const K_SRPROXY = "wnba26-srproxy-v1";
+const K_CALIB = "wnba26-calib-v4";
+
+/* ---------------- fetch helpers ---------------- */
+async function fjson(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${r.status} ${url}`);
+  return r.json();
+}
+async function pool(items, limit, fn, onProg) {
+  const out = new Array(items.length);
+  let i = 0, done = 0;
+  async function worker() {
+    while (i < items.length) {
+      const idx = i++;
+      try { out[idx] = await fn(items[idx], idx); } catch (e) { out[idx] = null; }
+      done++; onProg && onProg(done, items.length);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return out;
+}
+const ymd = (dt) => dt.toISOString().slice(0, 10).replace(/-/g, "");
+const ymdET = (iso) => new Date(iso).toLocaleDateString("en-CA", { timeZone: "America/New_York" }).replace(/-/g, "");
+const todayET = () => new Date().toLocaleDateString("en-CA", { timeZone: "America/New_York" }).replace(/-/g, "");
+const addDaysYmd = (y, n) => {
+  const d = new Date(Date.UTC(+y.slice(0, 4), +y.slice(4, 6) - 1, +y.slice(6, 8)));
+  d.setUTCDate(d.getUTCDate() + n);
+  return ymd(d);
+};
+function dateRange(fromYmd, toYmd) {
+  const out = [];
+  const d = new Date(`${fromYmd.slice(0, 4)}-${fromYmd.slice(4, 6)}-${fromYmd.slice(6, 8)}T12:00:00Z`);
+  while (ymd(d) <= toYmd) { out.push(ymd(d)); d.setUTCDate(d.getUTCDate() + 1); }
+  return out;
+}
+
+/* ---------------- ESPN parsing ---------------- */
+function parseScoreboardEvent(ev) {
+  const c = ev.competitions && ev.competitions[0];
+  if (!c) return null;
+  const home = c.competitors.find((x) => x.homeAway === "home");
+  const away = c.competitors.find((x) => x.homeAway === "away");
+  if (!home || !away) return null;
+  const oddsArr = c.odds || [];
+  const o = oddsArr.find((x) => x.overUnder != null || x.spread != null || x.homeTeamOdds) || oddsArr[0] || null;
+  let spread = null, total = null, mlH = null, mlA = null, spH = null, spA = null, totO = null, totU = null;
+  if (o) {
+    if (typeof o.spread === "number") spread = o.spread;
+    else if (o.details) {
+      const m = /([A-Z]{2,4})\s*(-?\d+(\.\d+)?)/.exec(o.details);
+      if (m) spread = m[1] === (home.team.abbreviation || "").toUpperCase() ? parseFloat(m[2]) : -parseFloat(m[2]);
+    }
+    if (typeof o.overUnder === "number") total = o.overUnder;
+    mlH = o.homeTeamOdds?.moneyLine ?? o.current?.home?.moneyLine?.american ?? null;
+    mlA = o.awayTeamOdds?.moneyLine ?? o.current?.away?.moneyLine?.american ?? null;
+    spH = o.homeTeamOdds?.spreadOdds ?? null;
+    spA = o.awayTeamOdds?.spreadOdds ?? null;
+    totO = o.overOdds ?? null;
+    totU = o.underOdds ?? null;
+    if (typeof mlH === "string") mlH = parseInt(mlH, 10);
+    if (typeof mlA === "string") mlA = parseInt(mlA, 10);
+  }
+  return {
+    id: ev.id,
+    date: ev.date,
+    d: ymdET(ev.date),
+    seasonType: ev.season?.type ?? null,
+    name: ev.name || ev.shortName || "",
+    state: ev.status?.type?.state || "pre",
+    statusTxt: ev.status?.type?.shortDetail || "",
+    completed: !!ev.status?.type?.completed,
+    home: { id: home.team.id, ab: home.team.abbreviation, name: home.team.shortDisplayName || home.team.displayName, pts: home.score != null ? +home.score : null },
+    away: { id: away.team.id, ab: away.team.abbreviation, name: away.team.shortDisplayName || away.team.displayName, pts: away.score != null ? +away.score : null },
+    odds: o ? { spread, total, mlH, mlA, spH, spA, totO, totU, provider: o.provider?.name || null } : null,
+  };
+}
+// regular season + playoffs only — preseason and All-Star never touch the model
+const isModelGame = (pe) => pe && pe.seasonType !== 1 && !/all-star/i.test(pe.name);
+
+// parse the fuller core odds endpoint for REAL american prices (vs the scoreboard's -110 assumption)
+const isAmer = (v) => typeof v === "number" && (v <= -100 || v >= 100);
+function parseEventOdds(json) {
+  const items = json.items || json.odds || [];
+  if (!items.length) return null;
+  const score = (it) => {
+    const nm = (it.provider?.name || "").toLowerCase();
+    let s = 0;
+    if (/draftkings|espn bet|caesars|fanduel|bet365|consensus/.test(nm)) s += 10;
+    if (it.spread != null) s += 1;
+    if (it.overUnder != null) s += 1;
+    if (isAmer(it.awayTeamOdds?.moneyLine) || isAmer(it.homeTeamOdds?.moneyLine)) s += 2;
+    if (isAmer(it.overOdds) || isAmer(it.underOdds)) s += 2;
+    return s;
+  };
+  const cand = items.filter((it) => it.spread != null || it.overUnder != null).sort((a, b) => score(b) - score(a))[0];
+  if (!cand) return null;
+  const amer = (v) => (isAmer(v) ? Math.round(v) : null);
+  return {
+    provider: cand.provider?.name || null,
+    spread: typeof cand.spread === "number" ? cand.spread : null,
+    total: typeof cand.overUnder === "number" ? cand.overUnder : null,
+    mlH: amer(cand.homeTeamOdds?.moneyLine), mlA: amer(cand.awayTeamOdds?.moneyLine),
+    spH: amer(cand.homeTeamOdds?.spreadOdds), spA: amer(cand.awayTeamOdds?.spreadOdds),
+    totO: amer(cand.overOdds), totU: amer(cand.underOdds),
+  };
+}
+function statVal(stats, name) {
+  const s = stats.find((x) => x.name === name);
+  return s ? s.displayValue : null;
+}
+function teamPossFromBox(stats) {
+  // poss = FGA + 0.44*FTA - ORB + TO  (real box only; null if any piece missing)
+  const fg = statVal(stats, "fieldGoalsMade-fieldGoalsAttempted");
+  const ft = statVal(stats, "freeThrowsMade-freeThrowsAttempted");
+  const orb = statVal(stats, "offensiveRebounds");
+  const to = statVal(stats, "turnovers") ?? statVal(stats, "totalTurnovers");
+  if (!fg || !ft || orb == null || to == null) return null;
+  const fga = parseInt(fg.split("-")[1], 10);
+  const fta = parseInt(ft.split("-")[1], 10);
+  const orbN = parseFloat(orb), toN = parseFloat(to);
+  if ([fga, fta, orbN, toN].some((x) => isNaN(x))) return null;
+  return fga + 0.44 * fta - orbN + toN;
+}
+
+/* ---------------- ratings (opponent-adjusted, regressed) ---------------- */
+function buildRatings(games, iters = 40) {
+  const rows = []; // {t, opp, ortg, poss, home, date, wt}
+  const teams = {};
+  const dated = games.filter((g) => g.hPts != null && g.aPts != null);
+  const lastDateY = dated.length ? (dated[dated.length - 1].d || ymdET(dated[dated.length - 1].date)) : todayET();
+  const dayNum = (y) => {
+    const yy = y || todayET();
+    return Math.floor(Date.UTC(+yy.slice(0, 4), +yy.slice(4, 6) - 1, +yy.slice(6, 8)) / 86400000);
+  };
+  const refDay = dayNum(lastDateY);
+  const HALFLIFE = 23; // days — recent form weighted ~2x vs 3+ weeks old
+  const lastGame = {}; // teamId -> most recent ymd played
+  for (const g of dated) {
+    teams[g.hId] = g.hAb; teams[g.aId] = g.aAb;
+    const gy = g.d || ymdET(g.date);
+    if (!lastGame[g.hId] || gy > lastGame[g.hId]) lastGame[g.hId] = gy;
+    if (!lastGame[g.aId] || gy > lastGame[g.aId]) lastGame[g.aId] = gy;
+    if (g.hPoss && g.aPoss) {
+      const gp = (g.hPoss + g.aPoss) / 2;
+      const wt = Math.pow(0.5, (refDay - dayNum(gy)) / HALFLIFE);
+      rows.push({ t: g.hId, opp: g.aId, ortg: (g.hPts / gp) * 100, poss: gp, home: 1, wt });
+      rows.push({ t: g.aId, opp: g.hId, ortg: (g.aPts / gp) * 100, poss: gp, home: 0, wt });
+    }
+  }
+  if (rows.length < 8) return null;
+  const wmean = (arr) => {
+    let s = 0, w = 0;
+    for (const x of arr) { s += x.v * x.w; w += x.w; }
+    return w ? s / w : null;
+  };
+  const lg = wmean(rows.map((r) => ({ v: r.ortg, w: r.wt })));
+  const lgPace = wmean(rows.map((r) => ({ v: r.poss, w: r.wt })));
+  const ids = Object.keys(teams);
+  const adjO = {}, adjD = {}, pace = {};
+  ids.forEach((id) => { adjO[id] = lg; adjD[id] = lg; pace[id] = lgPace; });
+  const K = 6;
+  for (let it = 0; it < iters; it++) {
+    const nO = {}, nD = {}, nP = {};
+    for (const id of ids) {
+      const off = rows.filter((r) => r.t === id);
+      const def = rows.filter((r) => r.opp === id);
+      const oAdj = off.map((r) => ({ v: r.ortg - (adjD[r.opp] - lg), w: r.wt }));
+      const dAdj = def.map((r) => ({ v: r.ortg - (adjO[r.t] - lg), w: r.wt }));
+      const pAdj = off.map((r) => ({ v: r.poss - (pace[r.opp] - lgPace), w: r.wt }));
+      const wEff = off.reduce((s, r) => s + r.wt, 0);
+      const wDef = def.reduce((s, r) => s + r.wt, 0);
+      const wO = wEff / (wEff + K), wD = wDef / (wDef + K);
+      nO[id] = lg + wO * ((wmean(oAdj) ?? lg) - lg);
+      nD[id] = lg + wD * ((wmean(dAdj) ?? lg) - lg);
+      nP[id] = lgPace + wO * ((wmean(pAdj) ?? lgPace) - lgPace);
+    }
+    ids.forEach((id) => { adjO[id] = nO[id]; adjD[id] = nD[id]; pace[id] = nP[id]; });
+  }
+  const margins = dated.map((g) => g.hPts - g.aPts);
+  const obs = mean(margins) ?? 2.0;
+  const hca = (margins.length * obs + 25 * 2.0) / (margins.length + 25);
+  const gp = {};
+  ids.forEach((id) => (gp[id] = rows.filter((r) => r.t === id).length));
+  return { lg, lgPace, hca, teams, adjO, adjD, pace, gp, lastGame, nGames: rows.length / 2 };
+}
+
+// rest/schedule points adjustment from days between games (WNBA B2Bs are punishing)
+function restPts(daysRest) {
+  if (daysRest == null) return 0;
+  if (daysRest <= 1) return -1.7;   // back-to-back (played yesterday)
+  if (daysRest === 2) return -0.4;
+  if (daysRest === 3) return 0.2;
+  return 0.5;                        // 4+ days rest
+}
+
+/* ---------------- Monte Carlo game sim ---------------- */
+function simGame(rt, hId, aId, adj = {}, calib = null, n = 20000) {
+  if (!rt || !rt.adjO[hId] || !rt.adjO[aId]) return null;
+  _rng = mulberry32(hashStr(`${hId}-${aId}-wnba26`)); _spare = null; // deterministic per matchup
+  const lg = rt.lg, lgP = rt.lgPace;
+  const expPace = clamp(rt.pace[hId] + rt.pace[aId] - lgP, lgP - 8, lgP + 8);
+  const hEff = lg + (rt.adjO[hId] - lg) + (rt.adjD[aId] - lg);
+  const aEff = lg + (rt.adjO[aId] - lg) + (rt.adjD[hId] - lg);
+  let hMu = (expPace * hEff) / 100 + rt.hca / 2 + (adj.hRest || 0) - (adj.hInjPts || 0);
+  let aMu = (expPace * aEff) / 100 - rt.hca / 2 + (adj.aRest || 0) - (adj.aInjPts || 0);
+  // ---- self-calibration from the walk-forward backtest (margin & total fit independently) ----
+  const baseSD = 10.3 * Math.sqrt(expPace / lgP);
+  const rhoPrior = 0.18;
+  let priorMarginSD = baseSD * Math.sqrt(2 * (1 - rhoPrior));
+  let priorTotalSD = baseSD * Math.sqrt(2 * (1 + rhoPrior));
+  let marginSD = priorMarginSD, totalSD = priorTotalSD;
+  let calOn = false;
+  if (calib && calib.n >= 20 && calib.marginFit && calib.totalFit) {
+    calOn = true;
+    // biasFit is pure mean-bias (slope=1, recency-weighted); apply directly
+    const rawMargin = hMu - aMu, rawTotal = hMu + aMu;
+    const calMargin = calib.marginFit.a + calib.marginFit.b * rawMargin;
+    const calTotal = calib.totalFit.a + calib.totalFit.b * rawTotal;
+    hMu = (calTotal + calMargin) / 2;
+    aMu = (calTotal - calMargin) / 2;
+    if (calib.marginFit.residSD) marginSD = calib.marginFit.residSD;
+    if (calib.totalFit.residSD) totalSD = calib.totalFit.residSD;
+  }
+  // solve per-team SD + correlation that reproduce the target margin and total spreads
+  const sd = Math.sqrt(Math.max((marginSD ** 2 + totalSD ** 2) / 4, 1));
+  const rho = clamp((totalSD ** 2 - marginSD ** 2) / (totalSD ** 2 + marginSD ** 2), -0.4, 0.6);
+  const minGP = Math.min(rt.gp?.[hId] ?? 20, rt.gp?.[aId] ?? 20);
+  const sdEff = sd * (1 + 0.6 / Math.sqrt(minGP + 1)); // extra width when these teams have few games
+  const q = Math.sqrt(1 - rho * rho);
+  const margins = new Float64Array(n), totals = new Float64Array(n);
+  let hw = 0;
+  for (let i = 0; i < n; i++) {
+    const z1 = randn(), z2 = rho * z1 + q * randn();
+    const hs = hMu + sdEff * z1, as = aMu + sdEff * z2;
+    margins[i] = hs - as; totals[i] = hs + as;
+    if (hs > as) hw++;
+  }
+  const ms = Array.from(margins).sort((a, b) => a - b);
+  return {
+    expPace, hMu, aMu, adj, calibrated: calOn,
+    pHomeML: hw / n,
+    fairSpread: -ms[Math.floor(n / 2)],
+    fairTotal: (hMu + aMu),
+    pHomeCover: (sp) => { let c = 0; for (let i = 0; i < n; i++) if (margins[i] + sp > 0) c++; return c / n; },
+    pOver: (t) => { let c = 0; for (let i = 0; i < n; i++) if (totals[i] > t) c++; return c / n; },
+  };
+}
+
+// per-game adjustments from schedule (rest + fatigue) + cached game logs & injuries (availability)
+function gameAdjustments(g, rt, glCache, injuries, rosters, games) {
+  const out = { hRest: 0, aRest: 0, hInjPts: 0, aInjPts: 0, outNames: { h: [], a: [] }, haveLogs: false, hFatigue: false, aFatigue: false };
+  if (!rt) return out;
+  const slateY = g.d || ymdET(g.date);
+  const dn = (y) => Math.floor(Date.UTC(+y.slice(0, 4), +y.slice(4, 6) - 1, +y.slice(6, 8)) / 86400000);
+  const restOf = (id) => (rt.lastGame?.[id] ? dn(slateY) - dn(rt.lastGame[id]) : null);
+  out.hRest = restPts(restOf(g.home.id));
+  out.aRest = restPts(restOf(g.away.id));
+  // schedule density: 3+ games in the prior 6 days compounds beyond simple rest (legs go late)
+  if (games && games.length) {
+    const d0 = dn(slateY);
+    const density = (id) => games.filter((x) => (x.hId === id || x.aId === id) && x.hPts != null && (() => { const dd = d0 - dn(x.d || ymdET(x.date)); return dd >= 1 && dd <= 6; })()).length;
+    if (density(g.home.id) >= 3) { out.hRest -= 0.8; out.hFatigue = true; }
+    if (density(g.away.id) >= 3) { out.aRest -= 0.8; out.aFatigue = true; }
+  }
+  // injury point loss: out players' recent scoring × leakage × availability-in-rating
+  const LEAK = 0.42;
+  const recentPPG = (gl) => {
+    const gms = (gl || []).filter((x) => x.min > 0 && x.pts != null).slice(-6);
+    return gms.length >= 3 ? mean(gms.map((x) => x.pts)) : null;
+  };
+  const teamLoss = (roster, teamId) => {
+    let lost = 0, names = [], any = false;
+    const teamGP = rt.gp?.[teamId] || 0;
+    for (const p of roster || []) {
+      const log = glCache[p.id]?.gl;
+      if (log) any = true;
+      const inj = injuries[normName(p.name)];
+      if (inj && /^(out|doubtful)/i.test(inj.status)) {
+        const ppg = recentPPG(log);
+        // a player who's barely played is already absent from the team's rating -> don't double-count
+        const playerGP = (log || []).filter((x) => x.min > 0).length;
+        const avail = teamGP > 0 ? clamp(playerGP / teamGP, 0, 1) : 1;
+        if (ppg != null && avail > 0.15) { const d = ppg * LEAK * avail; lost += d; names.push(`${p.name} (${ppg.toFixed(1)}${avail < 0.85 ? `, ${Math.round(avail * 100)}% avail` : ""})`); }
+      }
+    }
+    return { lost, names, any };
+  };
+  if (rosters) {
+    const h = teamLoss(rosters[g.home.id], g.home.id);
+    const a = teamLoss(rosters[g.away.id], g.away.id);
+    out.hInjPts = h.lost; out.aInjPts = a.lost;
+    out.outNames = { h: h.names, a: a.names };
+    out.haveLogs = h.any || a.any;
+  }
+  return out;
+}
+
+// fast analytic prediction (no MC) for walk-forward backtesting
+function predictAnalytic(rt, hId, aId, restAdj) {
+  if (!rt || !rt.adjO[hId] || !rt.adjO[aId]) return null;
+  const lg = rt.lg, lgP = rt.lgPace;
+  const expPace = clamp(rt.pace[hId] + rt.pace[aId] - lgP, lgP - 8, lgP + 8);
+  const hEff = lg + (rt.adjO[hId] - lg) + (rt.adjD[aId] - lg);
+  const aEff = lg + (rt.adjO[aId] - lg) + (rt.adjD[hId] - lg);
+  const hMu = (expPace * hEff) / 100 + rt.hca / 2 + (restAdj?.h || 0);
+  const aMu = (expPace * aEff) / 100 - rt.hca / 2 + (restAdj?.a || 0);
+  const sd = 10.3 * Math.sqrt(expPace / lgP);
+  const marginSD = sd * Math.sqrt(2 * (1 - 0.18));
+  return { margin: hMu - aMu, total: hMu + aMu, pHome: normCdf((hMu - aMu) / marginSD) };
+}
+
+// walk-forward: predict each game using ONLY games before it. Real out-of-sample validation.
+function runBacktest(games) {
+  const done = games.filter((g) => g.hPts != null && g.aPts != null && g.hPoss && g.aPoss)
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const dn = (y) => Math.floor(Date.UTC(+y.slice(0, 4), +y.slice(4, 6) - 1, +y.slice(6, 8)) / 86400000);
+  // calibration = pure recency-weighted mean-bias removal (slope LOCKED at 1.0).
+  // a regression slope on a weak predictor (low corr) just shrinks toward the mean and manufactures bias,
+  // so we only remove the average error — robust, can't overshoot, can't invent bias where none exists.
+  const biasFit = (pred, act) => {
+    const n = pred.length;
+    if (n < 8) return { a: 0, b: 1, residSD: null, n };
+    const lam = Math.log(2) / 18; // exponential half-life ~18 games -> tracks drift
+    let sw = 0, sw2 = 0, sBias = 0;
+    for (let i = 0; i < n; i++) { const w = Math.exp(-lam * (n - 1 - i)); sw += w; sw2 += w * w; sBias += w * (act[i] - pred[i]); }
+    const bias = sBias / sw;
+    let ss = 0;
+    for (let i = 0; i < n; i++) { const w = Math.exp(-lam * (n - 1 - i)); const r = act[i] - (pred[i] + bias); ss += w * r * r; }
+    const residSD = Math.sqrt(ss / sw);
+    const neff = (sw * sw) / sw2;                 // effective sample size
+    const se = residSD / Math.sqrt(Math.max(neff, 1)); // standard error of the mean bias
+    const shrink = (bias * bias) / (bias * bias + se * se); // apply only the statistically-reliable part of the bias
+    return { a: bias * shrink, b: 1, residSD, n };
+  };
+  let nMargin = 0, sumAbsM = 0, sumBiasM = 0, sumAbsT = 0, sumBiasT = 0, suCorrect = 0, suN = 0, sumSqM = 0, sumSqT = 0;
+  // honest out-of-sample: calibrate on games BEFORE i, apply to i, measure residual -> bias trends to 0 as it learns
+  let nCal = 0, sumCalAbsM = 0, sumCalAbsT = 0;
+  const calResidM = [], calResidT = [];
+  const predList = [], actList = [], predT = [], actT = [];
+  const buckets = Array.from({ length: 10 }, () => ({ n: 0, w: 0, p: 0 }));
+  const lastGame = {};
+  for (let i = 0; i < done.length; i++) {
+    const g = done[i];
+    const gy = g.d || ymdET(g.date);
+    const prior = done.slice(0, i);
+    const gpH = prior.filter((p) => p.hId === g.hId || p.aId === g.hId).length;
+    const gpA = prior.filter((p) => p.hId === g.aId || p.aId === g.aId).length;
+    if (gpH >= 4 && gpA >= 4) {
+      const rt = buildRatings(prior, 22);
+      const rest = {
+        h: lastGame[g.hId] != null ? restPts(dn(gy) - lastGame[g.hId]) : 0,
+        a: lastGame[g.aId] != null ? restPts(dn(gy) - lastGame[g.aId]) : 0,
+      };
+      const pr = rt && predictAnalytic(rt, g.hId, g.aId, rest);
+      if (pr) {
+        const actM = g.hPts - g.aPts, actTt = g.hPts + g.aPts;
+        sumAbsM += Math.abs(pr.margin - actM); sumBiasM += pr.margin - actM; sumSqM += (pr.margin - actM) ** 2;
+        sumAbsT += Math.abs(pr.total - actTt); sumBiasT += pr.total - actTt; sumSqT += (pr.total - actTt) ** 2;
+        // out-of-sample calibrated residual (fit only on what came before this game)
+        if (predList.length >= 15) {
+          const fm = biasFit(predList, actList), ft = biasFit(predT, actT);
+          const calM = fm.a + fm.b * pr.margin, calT = ft.a + ft.b * pr.total;
+          calResidM.push(calM - actM); calResidT.push(calT - actTt);
+          sumCalAbsM += Math.abs(calM - actM); sumCalAbsT += Math.abs(calT - actTt); nCal++;
+        }
+        predList.push(pr.margin); actList.push(actM); predT.push(pr.total); actT.push(actTt); nMargin++;
+        const homeWon = actM > 0 ? 1 : 0;
+        if ((pr.pHome >= 0.5 ? 1 : 0) === homeWon) suCorrect++;
+        suN++;
+        const b = Math.min(9, Math.floor(pr.pHome * 10));
+        buckets[b].n++; buckets[b].w += homeWon; buckets[b].p += pr.pHome;
+      }
+    }
+    lastGame[g.hId] = dn(gy); lastGame[g.aId] = dn(gy);
+  }
+  let corr = null;
+  if (predList.length > 3) {
+    const mp = mean(predList), ma = mean(actList);
+    let cov = 0, vp = 0, va = 0;
+    for (let i = 0; i < predList.length; i++) { cov += (predList[i] - mp) * (actList[i] - ma); vp += (predList[i] - mp) ** 2; va += (actList[i] - ma) ** 2; }
+    corr = cov / Math.sqrt(vp * va);
+  }
+  return {
+    n: nMargin,
+    marginMAE: nMargin ? sumAbsM / nMargin : null,
+    marginRMSE: nMargin ? Math.sqrt(sumSqM / nMargin) : null,
+    marginBias: nMargin ? sumBiasM / nMargin : null,
+    totalMAE: nMargin ? sumAbsT / nMargin : null,
+    totalRMSE: nMargin ? Math.sqrt(sumSqT / nMargin) : null,
+    totalBias: nMargin ? sumBiasT / nMargin : null,
+    nCal,
+    calMarginBias: calResidM.length ? mean(calResidM) : null,
+    calTotalBias: calResidT.length ? mean(calResidT) : null,
+    calMarginMAE: nCal ? sumCalAbsM / nCal : null,
+    calTotalMAE: nCal ? sumCalAbsT / nCal : null,
+    marginFit: biasFit(predList, actList),
+    totalFit: biasFit(predT, actT),
+    suAcc: suN ? suCorrect / suN : null,
+    corr,
+    buckets: buckets.filter((b) => b.n > 0).map((b) => ({ pred: b.p / b.n, act: b.w / b.n, n: b.n })),
+  };
+}
+
+/* ---------------- auto model ledger (CLV vs close, unbiased) ---------------- */
+function updateLedger(prev, slate, sims) {
+  const next = { ...prev };
+  let changed = false;
+  for (const g of slate) {
+    const sim = sims[g.id]; const o = g.odds;
+    if (!sim) continue;
+    const margin = g.home.pts != null && g.away.pts != null ? g.home.pts - g.away.pts : null;
+    const total = g.home.pts != null && g.away.pts != null ? g.home.pts + g.away.pts : null;
+    let e = next[g.id];
+    const isPre = g.state === "pre";
+    if (!e) {
+      if (!o) continue; // wait for a posted line before capturing
+      const sp = o.spread, tt = o.total;
+      const spH = o.spH ?? (sp != null ? -110 : null), spA = o.spA ?? (sp != null ? -110 : null);
+      const totO = o.totO ?? (tt != null ? -110 : null), totU = o.totU ?? (tt != null ? -110 : null);
+      e = { gid: g.id, date: g.date, away: g.away.ab, home: g.home.ab, capTs: Date.now(), mkts: {}, started: false, final: false };
+      if (sp != null) { const side = sim.pHomeCover(sp) >= 0.5 ? "H" : "A"; e.mkts.spread = { side, model: -sim.fairSpread, openSp: sp, openPrice: side === "H" ? spH : spA, lastSp: sp, lastPrice: side === "H" ? spH : spA }; }
+      if (tt != null) { const side = sim.pOver(tt) >= 0.5 ? "O" : "U"; e.mkts.total = { side, model: sim.fairTotal, openTot: tt, openPrice: side === "O" ? totO : totU, lastTot: tt, lastPrice: side === "O" ? totO : totU }; }
+      if (o.mlH != null && o.mlA != null) { const side = sim.pHomeML >= 0.5 ? "H" : "A"; e.mkts.ml = { side, model: side === "H" ? sim.pHomeML : 1 - sim.pHomeML, openH: o.mlH, openA: o.mlA, lastH: o.mlH, lastA: o.mlA }; }
+      if (Object.keys(e.mkts).length) { next[g.id] = e; changed = true; }
+      continue;
+    }
+    if (isPre && !e.started && o) {
+      const sp = o.spread, tt = o.total;
+      const spH = o.spH ?? (sp != null ? -110 : null), spA = o.spA ?? (sp != null ? -110 : null);
+      const totO = o.totO ?? (tt != null ? -110 : null), totU = o.totU ?? (tt != null ? -110 : null);
+      if (e.mkts.spread && sp != null) { e.mkts.spread.lastSp = sp; e.mkts.spread.lastPrice = e.mkts.spread.side === "H" ? spH : spA; changed = true; }
+      if (e.mkts.total && tt != null) { e.mkts.total.lastTot = tt; e.mkts.total.lastPrice = e.mkts.total.side === "O" ? totO : totU; changed = true; }
+      if (e.mkts.ml && o.mlH != null && o.mlA != null) { e.mkts.ml.lastH = o.mlH; e.mkts.ml.lastA = o.mlA; changed = true; }
+    }
+    if (!isPre && !e.started) { // game tipped -> freeze last seen line as the close
+      e.started = true;
+      if (e.mkts.spread) { e.mkts.spread.closeSp = e.mkts.spread.lastSp; e.mkts.spread.closePrice = e.mkts.spread.lastPrice; }
+      if (e.mkts.total) { e.mkts.total.closeTot = e.mkts.total.lastTot; e.mkts.total.closePrice = e.mkts.total.lastPrice; }
+      if (e.mkts.ml) { e.mkts.ml.closeH = e.mkts.ml.lastH; e.mkts.ml.closeA = e.mkts.ml.lastA; }
+      changed = true;
+    }
+    if (g.completed && margin != null && !e.final) {
+      e.final = true; e.score = `${g.away.pts}-${g.home.pts}`;
+      if (e.mkts.spread) { const cs = e.mkts.spread.closeSp ?? e.mkts.spread.lastSp; const cov = margin + cs; e.mkts.spread.result = e.mkts.spread.side === "H" ? (cov > 0 ? "W" : cov < 0 ? "L" : "P") : (cov < 0 ? "W" : cov > 0 ? "L" : "P"); }
+      if (e.mkts.total) { const ct = e.mkts.total.closeTot ?? e.mkts.total.lastTot; e.mkts.total.result = e.mkts.total.side === "O" ? (total > ct ? "W" : total < ct ? "L" : "P") : (total < ct ? "W" : total > ct ? "L" : "P"); }
+      if (e.mkts.ml) { e.mkts.ml.result = e.mkts.ml.side === "H" ? (margin > 0 ? "W" : "L") : (margin < 0 ? "W" : "L"); }
+      changed = true;
+    }
+  }
+  return changed ? next : prev;
+}
+// settle ledger entries from the completed-games cache (works even after games leave the slate)
+function settleLedgerFromGames(ledger, games) {
+  const byId = {};
+  for (const g of games) if (g.hPts != null && g.aPts != null) byId[g.id] = g;
+  let changed = false;
+  const next = { ...ledger };
+  for (const gid in next) {
+    const e = next[gid];
+    if (e.final) continue;
+    const g = byId[gid];
+    if (!g) continue;
+    const margin = g.hPts - g.aPts, total = g.hPts + g.aPts;
+    if (!e.started) { // never saw it tip — freeze the last line we did capture as the close
+      e.started = true;
+      if (e.mkts.spread) { e.mkts.spread.closeSp = e.mkts.spread.closeSp ?? e.mkts.spread.lastSp; e.mkts.spread.closePrice = e.mkts.spread.closePrice ?? e.mkts.spread.lastPrice; }
+      if (e.mkts.total) { e.mkts.total.closeTot = e.mkts.total.closeTot ?? e.mkts.total.lastTot; e.mkts.total.closePrice = e.mkts.total.closePrice ?? e.mkts.total.lastPrice; }
+      if (e.mkts.ml) { e.mkts.ml.closeH = e.mkts.ml.closeH ?? e.mkts.ml.lastH; e.mkts.ml.closeA = e.mkts.ml.closeA ?? e.mkts.ml.lastA; }
+    }
+    e.final = true; e.score = `${g.aPts}-${g.hPts}`;
+    if (e.mkts.spread) { const cs = e.mkts.spread.closeSp ?? e.mkts.spread.lastSp; const cov = margin + cs; e.mkts.spread.result = e.mkts.spread.side === "H" ? (cov > 0 ? "W" : cov < 0 ? "L" : "P") : (cov < 0 ? "W" : cov > 0 ? "L" : "P"); }
+    if (e.mkts.total) { const ct = e.mkts.total.closeTot ?? e.mkts.total.lastTot; e.mkts.total.result = e.mkts.total.side === "O" ? (total > ct ? "W" : total < ct ? "L" : "P") : (total < ct ? "W" : total > ct ? "L" : "P"); }
+    if (e.mkts.ml) { e.mkts.ml.result = e.mkts.ml.side === "H" ? (margin > 0 ? "W" : "L") : (margin < 0 ? "W" : "L"); }
+    changed = true;
+  }
+  return changed ? next : ledger;
+}
+const spreadClvPts = (m) => { const c = m.closeSp ?? m.lastSp; return m.side === "H" ? m.openSp - c : c - m.openSp; };
+const totalClvPts = (m) => { const c = m.closeTot ?? m.lastTot; return m.side === "O" ? c - m.openTot : m.openTot - c; };
+const mlClvPct = (m) => {
+  const cH = m.closeH ?? m.lastH, cA = m.closeA ?? m.lastA;
+  if (cH == null || cA == null) return null;
+  const [pH, pA] = devig2(cH, cA);
+  const pSide = m.side === "H" ? pH : pA;
+  const got = m.side === "H" ? m.openH : m.openA;
+  if (pSide == null || isNaN(a2d(got))) return null;
+  return (a2d(got) * pSide - 1) * 100;
+};
+
+function parseGamelog(json) {
+  const names = json.names || [];
+  const idx = (n) => names.indexOf(n);
+  const findIdx = (...cands) => { for (const c of cands) { const i = names.indexOf(c); if (i >= 0) return i; } return -1; };
+  const iMin = idx("minutes"), iPts = idx("points"), iAst = idx("assists");
+  const iReb = findIdx("rebounds", "totalRebounds", "rebs", "reb", "totReb");
+  const iOReb = findIdx("offensiveRebounds", "offRebounds");
+  const iDReb = findIdx("defensiveRebounds", "defRebounds");
+  const iTpm = names.findIndex((n) => n.startsWith("threePointFieldGoalsMade"));
+  const evMeta = json.events || {};
+  const rows = [];
+  for (const st of json.seasonTypes || []) {
+    for (const cat of st.categories || []) {
+      for (const ev of cat.events || []) {
+        const s = ev.stats || [];
+        const g = (i, split) => {
+          if (i < 0 || s[i] == null) return null;
+          const v = split ? String(s[i]).split("-")[0] : s[i];
+          const num = parseFloat(v);
+          return isNaN(num) ? null : num;
+        };
+        const min = g(iMin);
+        if (min == null) continue;
+        let reb = g(iReb);
+        if (reb == null) { const o = g(iOReb), d = g(iDReb); if (o != null && d != null) reb = o + d; } // fallback: ORB + DRB
+        rows.push({
+          eventId: ev.eventId,
+          date: evMeta[ev.eventId]?.gameDate || null,
+          min, pts: g(iPts), reb, ast: g(iAst), tpm: g(iTpm, true),
+        });
+      }
+    }
+  }
+  rows.sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  return rows;
+}
+function projectPlayer(gl, ctx) {
+  // ctx: { oppDefFactor, paceFactor }
+  const g = gl.filter((x) => x.min != null && x.min > 0 && x.pts != null);
+  if (g.length < 5) return null; // insufficient real sample -> null, never estimated
+  const last5 = g.slice(-5);
+  const minProj = 0.6 * mean(last5.map((x) => x.min)) + 0.4 * mean(g.map((x) => x.min));
+  // empirical-Bayes shrinkage: thin samples regress toward the player's full-season rate
+  const SHRINK = 4; // pseudo-games of prior weight
+  const rate = (key) => {
+    const seasonRate = mean(g.map((x) => x[key])) / mean(g.map((x) => x.min));
+    const recentRate = mean(last5.map((x) => x[key])) / mean(last5.map((x) => x.min));
+    const blended = 0.65 * seasonRate + 0.35 * recentRate;
+    // shrink the recency tilt back toward season mean when sample is small
+    const w = g.length / (g.length + SHRINK);
+    return w * blended + (1 - w) * seasonRate;
+  };
+  const dF = ctx.oppDefFactor, pF = ctx.paceFactor;
+  const mu = {
+    pts: rate("pts") * minProj * dF * pF,
+    reb: rate("reb") * minProj * Math.sqrt(dF) * pF,
+    ast: rate("ast") * minProj * Math.sqrt(dF) * pF,
+    tpm: g.every((x) => x.tpm == null) ? null : rate("tpm") * minProj * dF * pF,
+  };
+  mu.pra = mu.pts + mu.reb + mu.ast;
+  // widen SD for small samples (uncertainty in the rate itself), shrinking as n grows
+  const nInfl = 1 + 0.5 / Math.sqrt(g.length);
+  const sd = {
+    pts: Math.max((sdOf(g.map((x) => x.pts)) ?? 5) * nInfl, 3.8),
+    reb: Math.max((sdOf(g.map((x) => x.reb)) ?? 2.5) * nInfl, 1.9),
+    ast: Math.max((sdOf(g.map((x) => x.ast)) ?? 2) * nInfl, 1.4),
+  };
+  sd.pra = Math.sqrt(sd.pts ** 2 + sd.reb ** 2 + sd.ast ** 2) * 1.08; // mild positive correlation
+  return { n: g.length, minProj, mu, sd, last5Min: mean(last5.map((x) => x.min)) };
+}
+
+/* ============================================================ UI ============================================================ */
+const C = {
+  bg: "#0d1117", panel: "#151b24", panel2: "#1b2330", line: "#26303f",
+  txt: "#dde3ec", dim: "#8b96a8", faint: "#5b6678",
+  plus: "#3fd0a4", minus: "#ef6a5e", warn: "#e8b452", accent: "#6ea8fe",
+  mono: "ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace",
+  sans: "-apple-system, 'Inter', 'Segoe UI', system-ui, sans-serif",
+};
+const sCard = { background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 12, marginBottom: 10 };
+const sTh = { textAlign: "right", padding: "4px 6px", color: C.faint, fontWeight: 500, fontSize: 10, textTransform: "uppercase", letterSpacing: "0.06em" };
+const sTd = { textAlign: "right", padding: "4px 6px", fontFamily: C.mono, fontSize: 12, whiteSpace: "nowrap" };
+const evColor = (ev) => (ev == null ? C.dim : ev >= 2 ? C.plus : ev > 0 ? C.warn : C.minus);
+
+function Btn({ onClick, children, kind = "ghost", small, disabled }) {
+  const base = {
+    border: `1px solid ${kind === "primary" ? C.accent : C.line}`,
+    background: kind === "primary" ? "rgba(110,168,254,.12)" : "transparent",
+    color: kind === "primary" ? C.accent : C.txt,
+    borderRadius: 7, padding: small ? "4px 9px" : "8px 14px",
+    fontSize: small ? 11 : 13, fontFamily: C.sans, fontWeight: 600,
+    cursor: disabled ? "default" : "pointer", opacity: disabled ? 0.45 : 1,
+  };
+  return <button style={base} onClick={disabled ? undefined : onClick}>{children}</button>;
+}
+function Tag({ children, color = C.dim }) {
+  return <span style={{ fontSize: 10, fontFamily: C.mono, color, border: `1px solid ${C.line}`, borderRadius: 4, padding: "1px 5px", marginLeft: 6 }}>{children}</span>;
+}
+// slate-wide lean detector: catches systematic model-vs-market divergence the per-game guards miss
+function SlateLean({ slate, sims }) {
+  const games = slate.filter((g) => g.state === "pre" && sims[g.id] && g.odds);
+  if (games.length < 4) return null;
+  let tSum = 0, tN = 0, tUnder = 0, sSum = 0, sN = 0, sHome = 0;
+  for (const g of games) {
+    const sim = sims[g.id], o = g.odds;
+    if (o.total != null && sim.fairTotal != null) { const d = sim.fairTotal - o.total; tSum += d; tN++; if (d < -0.5) tUnder++; else if (d > 0.5) tUnder--; }
+    if (o.spread != null && sim.fairSpread != null) { const d = o.spread - sim.fairSpread; sSum += d; sN++; if (d > 0.5) sHome++; else if (d < -0.5) sHome--; }
+  }
+  const tAvg = tN ? tSum / tN : 0, sAvg = sN ? sSum / sN : 0;
+  const totalLean = tN >= 4 && Math.abs(tAvg) > 1.5;
+  const spreadLean = sN >= 4 && Math.abs(sAvg) > 2.5;
+  if (!totalLean && !spreadLean) return null;
+  const msgs = [];
+  if (totalLean) msgs.push(`${Math.abs(tAvg).toFixed(1)} pts ${tAvg < 0 ? "UNDER" : "OVER"} market on totals (${Math.abs(tUnder)}/${tN} games same way)`);
+  if (spreadLean) msgs.push(`favors the ${sAvg > 0 ? "HOME" : "AWAY"} side by ${Math.abs(sAvg).toFixed(1)} pts vs market (${Math.abs(sHome)}/${sN} games)`);
+  return (
+    <div style={{ ...sCard, padding: 12, borderColor: C.minus, marginBottom: 4 }}>
+      <div style={{ fontSize: 11, color: C.minus, fontWeight: 700, letterSpacing: ".05em", marginBottom: 6 }}>⚠ SLATE-WIDE LEAN DETECTED</div>
+      <div style={{ fontFamily: C.mono, fontSize: 12, lineHeight: 1.55, color: C.txt }}>
+        Across today's board the model {msgs.join(" · and ")}.<br />
+        <span style={{ color: C.faint }}>A uniform lean this size is usually one model parameter being off (HCA, totals environment), not many real edges. When you disagree with the whole market in one direction, the market is usually right — lean market on the tilted side, or settle it by checking Pinnacle.</span>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------- edge row ---------------- */
+function EdgeRow({ label, modelP, marketP, blendW, price, assumed, deviation, onLog }) {
+  const p = marketP != null && modelP != null ? blendW * modelP + (1 - blendW) * marketP : modelP;
+  const ev = price != null && p != null ? evPct(p, price) : null;
+  const k = price != null && p != null ? kellyQ(p, price) : null;
+  const fair = p2a(p);
+  const isML = /\bML\b/.test(label);
+  // moneyline disagreement guard + plausibility ceiling — same logic as the Picks tab, so the two never conflict
+  const mlGap = isML && marketP != null && modelP != null && blendW * Math.abs(modelP - marketP) > 0.045;
+  const tooGood = ev != null && ev > 12; // a ~market-neutral model can't really produce >12% — it's model error
+  const errFlag = !deviation && (mlGap || tooGood);
+  const flagged = deviation || errFlag;
+  return (
+    <tr style={{ borderTop: `1px solid ${C.line}` }}>
+      <td style={{ ...sTd, textAlign: "left", color: C.txt }}>{label}{assumed && <Tag color={C.warn}>-110 asm</Tag>}{deviation && <Tag color={C.minus}>⚠ dev</Tag>}{errFlag && <Tag color={C.minus}>⚠ err</Tag>}</td>
+      <td style={sTd}>{price == null ? "—" : fmtA(price)}</td>
+      <td style={sTd} title={`model ${pct(modelP)}${marketP != null ? ` · mkt ${pct(marketP)}` : ""}`}>{pct(p)}</td>
+      <td style={sTd}>{fair == null ? "—" : fmtA(fair)}</td>
+      <td style={{ ...sTd, color: flagged ? C.faint : evColor(ev), fontWeight: 700 }}>{ev == null ? "—" : flagged ? "flagged" : (ev > 0 ? "+" : "") + ev.toFixed(1) + "%"}</td>
+      <td style={sTd}>{flagged || k == null || k <= 0 ? "—" : k.toFixed(2) + "u"}</td>
+      <td style={{ ...sTd, padding: "2px 4px" }}>
+        {!flagged && ev != null && ev > 0 && <Btn small onClick={() => onLog(p)}>log</Btn>}
+      </td>
+    </tr>
+  );
+}
+
+function GameCard({ g, sim, ratings, blendW, ledgerEntry, onLogBet, onOpenProps }) {
+  const o = g.odds;
+  const sp = o?.spread ?? null;
+  const tt = o?.total ?? null;
+  const spH = o?.spH ?? (sp != null ? -110 : null);
+  const spA = o?.spA ?? (sp != null ? -110 : null);
+  const totO = o?.totO ?? (tt != null ? -110 : null);
+  const totU = o?.totU ?? (tt != null ? -110 : null);
+  const pCovH = sim && sp != null ? sim.pHomeCover(sp) : null;
+  const pOv = sim && tt != null ? sim.pOver(tt) : null;
+  // market no-vig probabilities for blending
+  const [mMlH, mMlA] = o && o.mlH != null && o.mlA != null ? devig2(o.mlH, o.mlA) : [null, null];
+  const [mSpH, mSpA] = o && spH != null && spA != null ? devig2(spH, spA) : [null, null];
+  const [mOv, mUn] = o && totO != null && totU != null ? devig2(totO, totU) : [null, null];
+  const time = new Date(g.date).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const mk = (desc, side, line, odds) => (p) => onLogBet({ eventId: g.id, gameDate: g.date, desc, side, line, odds, fairP: p });
+  const adj = sim?.adj || {};
+  const conf = (ratings?.gp?.[g.home.id] ?? 0) >= 8 && (ratings?.gp?.[g.away.id] ?? 0) >= 8;
+  const injTotal = (adj.hInjPts || 0) + (adj.aInjPts || 0);
+  const effW = blendW * clamp(1 - injTotal / 16, 0.2, 1);
+  // deviation flag judges the BLENDED line you'd actually bet (≈ effW of the raw gap), not the raw model
+  const DEV = 5; // blended line gap (pts) beyond which the disagreement is suspect, not bettable
+  const spreadDev = sim && sp != null ? effW * Math.abs(sim.fairSpread - sp) : 0;
+  const totalDev = sim && tt != null ? effW * Math.abs(sim.fairTotal - tt) : 0;
+  const spreadFlag = spreadDev > DEV;
+  const totalFlag = totalDev > DEV;
+  const adjBits = [];
+  if (adj.hRest || adj.aRest) adjBits.push(`rest ${g.away.ab} ${(adj.aRest >= 0 ? "+" : "")}${adj.aRest?.toFixed(1)} / ${g.home.ab} ${(adj.hRest >= 0 ? "+" : "")}${adj.hRest?.toFixed(1)}`);
+  if (adj.aInjPts > 0.2) adjBits.push(`${g.away.ab} out −${adj.aInjPts.toFixed(1)}`);
+  if (adj.hInjPts > 0.2) adjBits.push(`${g.home.ab} out −${adj.hInjPts.toFixed(1)}`);
+  if (adj.hFatigue) adjBits.push(`${g.home.ab} 3-in-6 fatigue`);
+  if (adj.aFatigue) adjBits.push(`${g.away.ab} 3-in-6 fatigue`);
+  // line movement since first capture (open) -> current, with model-agreement signal
+  const moves = [];
+  const le = ledgerEntry;
+  if (le && sim) {
+    if (le.mkts?.spread && sp != null && Math.abs(le.mkts.spread.openSp - sp) >= 0.5) {
+      const towardModel = Math.abs(sim.fairSpread - sp) < Math.abs(sim.fairSpread - le.mkts.spread.openSp);
+      moves.push({ txt: `spread ${le.mkts.spread.openSp > 0 ? "+" : ""}${le.mkts.spread.openSp} → ${sp > 0 ? "+" : ""}${sp}`, toward: towardModel });
+    }
+    if (le.mkts?.total && tt != null && Math.abs(le.mkts.total.openTot - tt) >= 0.5) {
+      const towardModel = Math.abs(sim.fairTotal - tt) < Math.abs(sim.fairTotal - le.mkts.total.openTot);
+      moves.push({ txt: `total ${le.mkts.total.openTot} → ${tt}`, toward: towardModel });
+    }
+  }
+  return (
+    <div style={sCard}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
+        <div style={{ fontWeight: 700, fontSize: 14 }}>{g.away.ab} @ {g.home.ab} <span style={{ color: C.faint, fontWeight: 400, fontSize: 11 }}>{time}</span></div>
+        <div style={{ display: "flex", gap: 6 }}>
+          {o?.provider && <Tag>{o.provider}</Tag>}
+          <Btn small onClick={() => onOpenProps(g)}>props →</Btn>
+        </div>
+      </div>
+      {sim ? (
+        <>
+          <div style={{ fontFamily: C.mono, fontSize: 11, color: C.dim, marginBottom: adjBits.length ? 3 : 8 }}>
+            model: {g.home.ab} {sim.fairSpread > 0 ? "+" : ""}{sim.fairSpread.toFixed(1)} · proj {sim.aMu.toFixed(1)}–{sim.hMu.toFixed(1)} · total {sim.fairTotal.toFixed(1)} · pace {sim.expPace.toFixed(1)}{sim.calibrated ? <span style={{ color: C.plus }}> · cal✓</span> : ""}
+          </div>
+          {adjBits.length > 0 && (
+            <div style={{ fontFamily: C.mono, fontSize: 10, color: C.warn, marginBottom: 8 }}>adj: {adjBits.join(" · ")}
+              {(adj.outNames?.a?.length || adj.outNames?.h?.length) ? ` · out: ${[...adj.outNames.a, ...adj.outNames.h].join(", ")}` : ""}
+              {injTotal > 2 ? ` · injuries public → lines auto-weighted ${Math.round((1 - effW / (blendW || 1)) * 100)}% more to market` : ""}
+            </div>
+          )}
+          {moves.length > 0 && (
+            <div style={{ fontFamily: C.mono, fontSize: 10, marginBottom: 8 }}>
+              {moves.map((m, i) => (
+                <span key={i} style={{ color: m.toward ? C.plus : C.minus, marginRight: 10 }}>
+                  ↗ {m.txt} {m.toward ? "(toward model ✓)" : "(against model ⚠)"}
+                </span>
+              ))}
+            </div>
+          )}
+          {(spreadFlag || totalFlag) && (
+            <div style={{ fontFamily: C.mono, fontSize: 10, color: C.minus, marginBottom: 8, lineHeight: 1.45 }}>
+              ⚠ deviation: even after blending to market, your number is {totalFlag ? `${totalDev.toFixed(1)} off on total` : ""}{spreadFlag && totalFlag ? " · " : ""}{spreadFlag ? `${spreadDev.toFixed(1)} off on spread` : ""}. Too far to trust — likely model error, not edge. Flagged, not bettable.
+            </div>
+          )}
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead><tr>
+              <th style={{ ...sTh, textAlign: "left" }}>market</th><th style={sTh}>price</th><th style={sTh}>proj</th><th style={sTh}>fair</th><th style={sTh}>EV</th><th style={sTh}>¼K</th><th style={sTh}></th>
+            </tr></thead>
+            <tbody>
+              <EdgeRow label={`${g.home.ab} ML`} modelP={sim.pHomeML} marketP={mMlH} blendW={effW} price={o?.mlH ?? null} deviation={spreadFlag} onLog={mk(`${g.away.ab}@${g.home.ab}`, `${g.home.ab} ML`, null, o?.mlH)} />
+              <EdgeRow label={`${g.away.ab} ML`} modelP={1 - sim.pHomeML} marketP={mMlA} blendW={effW} price={o?.mlA ?? null} deviation={spreadFlag} onLog={mk(`${g.away.ab}@${g.home.ab}`, `${g.away.ab} ML`, null, o?.mlA)} />
+              {sp != null && <>
+                <EdgeRow label={`${g.home.ab} ${sp > 0 ? "+" : ""}${sp}`} modelP={pCovH} marketP={mSpH} blendW={effW} price={spH} assumed={o?.spH == null} deviation={spreadFlag} onLog={mk(`${g.away.ab}@${g.home.ab}`, `${g.home.ab} ${sp}`, sp, spH)} />
+                <EdgeRow label={`${g.away.ab} ${-sp > 0 ? "+" : ""}${-sp}`} modelP={1 - pCovH} marketP={mSpA} blendW={effW} price={spA} assumed={o?.spA == null} deviation={spreadFlag} onLog={mk(`${g.away.ab}@${g.home.ab}`, `${g.away.ab} ${-sp}`, -sp, spA)} />
+              </>}
+              {tt != null && <>
+                <EdgeRow label={`Over ${tt}`} modelP={pOv} marketP={mOv} blendW={effW} price={totO} assumed={o?.totO == null} deviation={totalFlag} onLog={mk(`${g.away.ab}@${g.home.ab}`, `O${tt}`, tt, totO)} />
+                <EdgeRow label={`Under ${tt}`} modelP={1 - pOv} marketP={mUn} blendW={effW} price={totU} assumed={o?.totU == null} deviation={totalFlag} onLog={mk(`${g.away.ab}@${g.home.ab}`, `U${tt}`, tt, totU)} />
+              </>}
+            </tbody>
+          </table>
+          {!o && <div style={{ color: C.faint, fontSize: 11, marginTop: 6 }}>market line: null (not posted on feed yet)</div>}
+          {!conf && <div style={{ color: C.faint, fontSize: 10, marginTop: 6 }}>⚠ thin sample (&lt;8 games) — edges low-confidence; market weight recommended</div>}
+        </>
+      ) : (
+        <div style={{ color: C.faint, fontSize: 12 }}>{ratings ? "team not yet rated (insufficient games)" : "sync season data to rate this game"}</div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- props panel ---------------- */
+const MARKETS = [
+  { key: "pts", label: "PTS", dist: "norm", step: 1, span: 3 },
+  { key: "reb", label: "REB", dist: "norm", step: 1, span: 2 },
+  { key: "ast", label: "AST", dist: "norm", step: 1, span: 2 },
+  { key: "pra", label: "PRA", dist: "norm", step: 1, span: 3 },
+  { key: "tpm", label: "3PM", dist: "pois", step: 1, span: 2 },
+];
+function lineGrid(mu, span, step) {
+  const c = Math.round(mu) + 0.5 - 1; // center-ish .5 line at/just below mu
+  const out = [];
+  for (let l = c - (span - 1) * step; l <= c + span * step; l += step) if (l > 0) out.push(l);
+  return out;
+}
+function PlayerCard({ p, proj, out, onToggleOut, injury }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ ...sCard, padding: 10, opacity: out ? 0.5 : 1 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div onClick={() => setOpen(!open)} style={{ cursor: "pointer" }}>
+          <span style={{ fontWeight: 700, fontSize: 13 }}>{p.name}</span>
+          <span style={{ color: C.faint, fontSize: 11 }}> {p.pos || ""}</span>
+          {injury && <Tag color={/out/i.test(injury.status) ? C.minus : C.warn}>{injury.status}</Tag>}
+        </div>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          {proj && <span style={{ fontFamily: C.mono, fontSize: 11, color: C.dim }}>{f1(proj.adjMin)}m</span>}
+          <Btn small onClick={onToggleOut}>{out ? "restore" : "rule out"}</Btn>
+        </div>
+      </div>
+      {proj ? (
+        <div style={{ marginTop: 6 }}>
+          <div style={{ display: "flex", gap: 12, fontFamily: C.mono, fontSize: 12, flexWrap: "wrap" }}>
+            {MARKETS.map((m) => proj.mu[m.key] != null && (
+              <span key={m.key}><span style={{ color: C.faint }}>{m.label}</span> <b style={{ color: C.txt }}>{f1(proj.mu[m.key])}</b></span>
+            ))}
+            <span style={{ color: C.faint, fontSize: 10 }}>n={proj.n}</span>
+          </div>
+          {open && !out && (
+            <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
+              {MARKETS.map((m) => {
+                const mu = proj.mu[m.key];
+                if (mu == null) return null;
+                const lines = lineGrid(mu, m.span, m.step);
+                return (
+                  <div key={m.key}>
+                    <div style={{ fontSize: 10, color: C.faint, letterSpacing: ".06em", marginBottom: 3 }}>{m.label} — μ {f1(mu)}{m.dist === "norm" ? ` σ ${f1(proj.sd[m.key])}` : " (poisson)"}</div>
+                    <div style={{ display: "flex", gap: 4, overflowX: "auto" }}>
+                      {lines.map((L) => {
+                        const pO = m.dist === "norm" ? pOverNormal(L, mu, proj.sd[m.key]) : 1 - poisCdf(Math.floor(L), mu);
+                        return (
+                          <div key={L} style={{ minWidth: 64, background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 6, padding: "4px 6px", textAlign: "center" }}>
+                            <div style={{ fontFamily: C.mono, fontSize: 11, color: C.dim }}>{L}</div>
+                            <div style={{ fontFamily: C.mono, fontSize: 12, fontWeight: 700, color: pO >= 0.55 ? C.plus : pO <= 0.45 ? C.minus : C.txt }}>{(pO * 100).toFixed(0)}%</div>
+                            <div style={{ fontFamily: C.mono, fontSize: 10, color: C.faint }}>{fmtA(p2a(pO))}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+              <div style={{ fontSize: 10, color: C.faint }}>% = model P(over) · odds = no-vig fair price. Beat these by your hold threshold at the book.</div>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div style={{ color: C.faint, fontSize: 11, marginTop: 4 }}>projection: null (fewer than 5 games with minutes — not estimating)</div>
+      )}
+    </div>
+  );
+}
+
+function PropsPanel({ game, ratings, gamelogCache, setGamelogCache, injuries }) {
+  const [loading, setLoading] = useState(false);
+  const [prog, setProg] = useState("");
+  const [players, setPlayers] = useState(null); // [{id,name,pos,teamId,teamAb,gl}]
+  const [outs, setOuts] = useState({});
+  const [err, setErr] = useState(null);
+
+  const load = useCallback(async () => {
+    setLoading(true); setErr(null);
+    try {
+      const tms = [game.home, game.away];
+      const rosters = await pool(tms, 2, async (t) => {
+        const j = await fjson(ROSTER_URL(t.id));
+        let ath = j.athletes || [];
+        if (ath.length && ath[0].items) ath = ath.flatMap((g2) => g2.items);
+        return ath.map((a) => ({ id: a.id, name: a.fullName || a.displayName, pos: a.position?.abbreviation || null, teamId: t.id, teamAb: t.ab }));
+      });
+      const all = rosters.flat().filter(Boolean);
+      const cache = { ...gamelogCache };
+      const today = new Date().toISOString().slice(0, 10);
+      const need = all.filter((p) => !cache[p.id] || cache[p.id].d !== today);
+      let done = 0;
+      await pool(need, 4, async (p) => {
+        try {
+          const j = await fjson(GL_URL(p.id));
+          cache[p.id] = { d: today, gl: parseGamelog(j) };
+        } catch (e) { cache[p.id] = { d: today, gl: [] }; }
+        done++; setProg(`game logs ${done}/${need.length}`);
+      });
+      setGamelogCache(cache);
+      store.set(K_GL, cache);
+      // auto-rule-out players ESPN lists as Out
+      const autoOuts = {};
+      for (const p of all) {
+        const inj = injuries[normName(p.name)];
+        if (inj && /^out/i.test(inj.status)) autoOuts[p.id] = true;
+      }
+      setOuts(autoOuts);
+      setPlayers(all.map((p) => ({ ...p, gl: cache[p.id]?.gl || [] })));
+    } catch (e) { setErr(String(e.message || e)); }
+    setLoading(false); setProg("");
+  }, [game, gamelogCache, injuries, setGamelogCache]);
+
+  const computed = useMemo(() => {
+    if (!players || !ratings) return null;
+    const lg = ratings.lg, lgPace = ratings.lgPace;
+    const expPace = clamp(ratings.pace[game.home.id] + ratings.pace[game.away.id] - lgPace, lgPace - 8, lgPace + 8);
+    const byTeam = {};
+    for (const t of [game.home, game.away]) {
+      const oppId = t.id === game.home.id ? game.away.id : game.home.id;
+      const dF = clamp(ratings.adjD[oppId] / lg, 0.92, 1.08);
+      const teamPace = ratings.pace[t.id] || lgPace;
+      const pF = clamp(expPace / teamPace, 0.92, 1.08);
+      const tp = players.filter((p) => p.teamId === t.id);
+      const base = tp.map((p) => ({ p, proj: projectPlayer(p.gl, { oppDefFactor: dF, paceFactor: pF }) }));
+      // minutes redistribution for ruled-out players
+      const active = base.filter((x) => x.proj && !outs[x.p.id]);
+      const removed = base.filter((x) => x.proj && outs[x.p.id]).reduce((s, x) => s + x.proj.minProj, 0);
+      const activeMin = active.reduce((s, x) => s + x.proj.minProj, 0) || 1;
+      const minF = removed > 0 ? (activeMin + removed) / activeMin : 1;
+      const usageF = removed > 0 ? 1 + 0.25 * (removed / 200) : 1;
+      byTeam[t.id] = base
+        .map((x) => {
+          if (!x.proj) return { ...x, adj: null };
+          const adjMin = outs[x.p.id] ? x.proj.minProj : Math.min(x.proj.minProj * minF, 36.5);
+          const mf = adjMin / x.proj.minProj;
+          const mu = {
+            pts: x.proj.mu.pts * mf * usageF,
+            reb: x.proj.mu.reb * mf,
+            ast: x.proj.mu.ast * mf * usageF,
+            tpm: x.proj.mu.tpm == null ? null : x.proj.mu.tpm * mf * usageF,
+          };
+          mu.pra = mu.pts + mu.reb + mu.ast;
+          return { ...x, adj: { ...x.proj, adjMin, mu } };
+        })
+        .sort((a, b) => (b.adj?.mu.pts ?? -1) - (a.adj?.mu.pts ?? -1));
+    }
+    return byTeam;
+  }, [players, ratings, outs, game]);
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ fontWeight: 700 }}>{game.away.ab} @ {game.home.ab} — props</div>
+        <Btn kind="primary" small onClick={load} disabled={loading}>{loading ? prog || "loading…" : players ? "refresh" : "load rosters + logs"}</Btn>
+      </div>
+      {err && <div style={{ color: C.minus, fontSize: 12, marginBottom: 8 }}>fetch failed: {err}</div>}
+      {!players && !loading && <div style={{ color: C.faint, fontSize: 12 }}>Pulls both rosters and every player's real {SEASON} game log from ESPN, then projects PTS / REB / AST / PRA / 3PM vs this opponent (defense + pace adjusted). Players listed Out are auto-removed and their minutes redistributed.</div>}
+      {computed && [game.away, game.home].map((t) => (
+        <div key={t.id} style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: C.accent, letterSpacing: ".08em", margin: "8px 0 6px", fontWeight: 700 }}>{t.name.toUpperCase()}</div>
+          {computed[t.id].map(({ p, adj }) => (
+            <PlayerCard key={p.id} p={p} proj={adj} out={!!outs[p.id]} injury={injuries[normName(p.name)] || null}
+              onToggleOut={() => setOuts((o) => ({ ...o, [p.id]: !o[p.id] }))} />
+          ))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------- ratings table ---------------- */
+function RatingsTab({ ratings, games }) {
+  if (!ratings) return <div style={{ color: C.faint, fontSize: 13 }}>No ratings yet — run sync.</div>;
+  const withBox = games.filter((g) => g.hPoss != null && g.aPoss != null).length;
+  const first = games.length ? (games[0].d || ymdET(games[0].date)) : null;
+  const lastG = games.length ? (games[games.length - 1].d || ymdET(games[games.length - 1].date)) : null;
+  const fd = (y) => y ? `${y.slice(4, 6)}/${y.slice(6, 8)}` : "—";
+  const rows = Object.keys(ratings.teams)
+    .map((id) => ({ id, ab: ratings.teams[id], o: ratings.adjO[id], d: ratings.adjD[id], p: ratings.pace[id], n: ratings.gp[id], net: ratings.adjO[id] - ratings.adjD[id] }))
+    .sort((a, b) => b.net - a.net);
+  return (
+    <div style={sCard}>
+      <div style={{ fontSize: 11, color: C.dim, marginBottom: 4, fontFamily: C.mono }}>
+        {ratings.nGames} games w/ box · lg eff {ratings.lg.toFixed(1)} · lg pace {ratings.lgPace.toFixed(1)} · HCA {ratings.hca.toFixed(1)} pts · regressed n/(n+6)
+      </div>
+      <div style={{ fontSize: 11, marginBottom: 8, fontFamily: C.mono, color: withBox === games.length ? C.plus : C.warn }}>
+        audit: {games.length} finals cached ({fd(first)}–{fd(lastG)}) · box parsed {withBox}/{games.length}{withBox < games.length ? " — missing boxes auto-retry next sync" : " ✓"}
+      </div>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <thead><tr><th style={{ ...sTh, textAlign: "left" }}>team</th><th style={sTh}>adjO</th><th style={sTh}>adjD</th><th style={sTh}>net</th><th style={sTh}>pace</th><th style={sTh}>gp</th></tr></thead>
+        <tbody>{rows.map((r) => (
+          <tr key={r.id} style={{ borderTop: `1px solid ${C.line}` }}>
+            <td style={{ ...sTd, textAlign: "left", fontWeight: 700 }}>{r.ab}</td>
+            <td style={sTd}>{r.o.toFixed(1)}</td>
+            <td style={sTd}>{r.d.toFixed(1)}</td>
+            <td style={{ ...sTd, color: r.net >= 0 ? C.plus : C.minus, fontWeight: 700 }}>{(r.net >= 0 ? "+" : "") + r.net.toFixed(1)}</td>
+            <td style={sTd}>{r.p.toFixed(1)}</td>
+            <td style={sTd}>{r.n}</td>
+          </tr>
+        ))}</tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ---------------- bet log ---------------- */
+function LogTab({ log, setLog }) {
+  const [closeFor, setCloseFor] = useState(null);
+  const [closeVal, setCloseVal] = useState("");
+  const [msg, setMsg] = useState(null);
+  const settled = log.filter((b) => b.result);
+  const units = settled.reduce((s, b) => s + (b.result === "W" ? (a2d(b.odds) - 1) * b.stake : b.result === "L" ? -b.stake : 0), 0);
+  const risked = settled.reduce((s, b) => s + (b.result === "P" ? 0 : b.stake), 0);
+  const clvs = log.filter((b) => b.clv != null).map((b) => b.clv);
+  const briers = settled.filter((b) => b.fairP != null && b.result !== "P");
+  const brier = briers.length ? mean(briers.map((b) => ((b.result === "W" ? 1 : 0) - b.fairP) ** 2)) : null;
+  const upd = (id, patch) => setLog((L) => L.map((b) => (b.id === id ? { ...b, ...patch } : b)));
+  const settle = async (b) => {
+    try {
+      const d = ymdET(b.gameDate);
+      const j = await fjson(SB_URL(d));
+      const ev = (j.events || []).find((e) => e.id === b.eventId);
+      const pe = ev && parseScoreboardEvent(ev);
+      if (!pe || !pe.completed) return setMsg("Game not final yet.");
+      const margin = pe.home.pts - pe.away.pts, total = pe.home.pts + pe.away.pts;
+      let res = null;
+      const s = b.side;
+      if (/ML$/.test(s)) res = (s.startsWith(pe.home.ab) ? margin > 0 : margin < 0) ? "W" : "L";
+      else if (/^O/.test(s)) res = total > b.line ? "W" : total < b.line ? "L" : "P";
+      else if (/^U/.test(s)) res = total < b.line ? "W" : total > b.line ? "L" : "P";
+      else { const cov = s.startsWith(pe.home.ab) ? margin + b.line : -margin + b.line; res = cov > 0 ? "W" : cov < 0 ? "L" : "P"; }
+      upd(b.id, { result: res, final: `${pe.away.pts}-${pe.home.pts}` });
+    } catch (e) { setMsg("Settle fetch failed."); }
+  };
+  return (
+    <div>
+      <div style={{ ...sCard, display: "flex", gap: 16, fontFamily: C.mono, fontSize: 12, flexWrap: "wrap" }}>
+        <span><span style={{ color: C.faint }}>record</span> <b>{settled.filter((b) => b.result === "W").length}-{settled.filter((b) => b.result === "L").length}</b></span>
+        <span><span style={{ color: C.faint }}>units</span> <b style={{ color: units >= 0 ? C.plus : C.minus }}>{(units >= 0 ? "+" : "") + units.toFixed(2)}</b></span>
+        <span><span style={{ color: C.faint }}>ROI</span> <b>{risked ? ((units / risked) * 100).toFixed(1) + "%" : "—"}</b></span>
+        <span><span style={{ color: C.faint }}>avg CLV</span> <b style={{ color: clvs.length && mean(clvs) > 0 ? C.plus : C.txt }}>{clvs.length ? mean(clvs).toFixed(2) + "%" : "—"}</b></span>
+        <span><span style={{ color: C.faint }}>Brier</span> <b>{brier == null ? "—" : brier.toFixed(3)}</b></span>
+      </div>
+      {msg && <div style={{ ...sCard, color: C.warn, fontSize: 12 }}>{msg}</div>}
+      {log.length === 0 && <div style={{ color: C.faint, fontSize: 13 }}>Log +EV plays from the slate cards. Settling pulls the real final score; CLV is computed from the closing price you enter at tip.</div>}
+      {[...log].reverse().map((b) => (
+        <div key={b.id} style={{ ...sCard, padding: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ fontSize: 13 }}>
+              <b>{b.side}</b> <span style={{ fontFamily: C.mono }}>{fmtA(b.odds)}</span>
+              <span style={{ color: C.faint, fontSize: 11 }}> · {b.desc} · {b.stake}u · fair {pct(b.fairP)}</span>
+              {b.final && <Tag>{b.final}</Tag>}
+            </div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              {b.clv != null && <span style={{ fontFamily: C.mono, fontSize: 11, color: b.clv > 0 ? C.plus : C.minus }}>CLV {(b.clv > 0 ? "+" : "") + b.clv.toFixed(1)}%</span>}
+              {b.result ? (
+                <span style={{ fontFamily: C.mono, fontWeight: 800, color: b.result === "W" ? C.plus : b.result === "L" ? C.minus : C.dim }}>{b.result}</span>
+              ) : closeFor === b.id ? (
+                <>
+                  <input value={closeVal} onChange={(e) => setCloseVal(e.target.value)} placeholder="-118" inputMode="numeric"
+                    style={{ width: 64, background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 6, color: C.txt, fontFamily: C.mono, fontSize: 12, padding: "4px 6px" }} />
+                  <Btn small kind="primary" onClick={() => { const n = parseInt(closeVal, 10); if (!isNaN(n) && Math.abs(n) >= 100) { upd(b.id, { clv: (a2d(b.odds) / a2d(n) - 1) * 100 }); } setCloseFor(null); setCloseVal(""); }}>set</Btn>
+                </>
+              ) : (
+                <>
+                  <Btn small onClick={() => { setCloseFor(b.id); setCloseVal(""); }}>close</Btn>
+                  <Btn small onClick={() => settle(b)}>settle</Btn>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------- validation / backtest ---------------- */
+function ValidationTab({ games, calib }) {
+  const [res, setRes] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const run = () => {
+    setBusy(true);
+    setTimeout(() => { setRes(runBacktest(games)); setBusy(false); }, 30);
+  };
+  const finals = games.filter((g) => g.hPts != null && g.hPoss && g.aPoss).length;
+  return (
+    <div>
+      <div style={sCard}>
+        <div style={{ fontSize: 13, marginBottom: 8, lineHeight: 1.5 }}>
+          Walk-forward validation: every completed game is predicted using <b>only games played before it</b> — true out-of-sample, no peeking. This is the proof the rating engine actually predicts, not just fits.
+        </div>
+        <Btn kind="primary" onClick={run} disabled={busy || finals < 20}>{busy ? "running…" : finals < 20 ? `need ≥20 finals (have ${finals})` : `run backtest (${finals} finals)`}</Btn>
+      </div>
+      <div style={{ ...sCard, borderColor: calib ? C.plus : C.line }}>
+        <div style={{ fontSize: 11, color: calib ? C.plus : C.faint, letterSpacing: ".06em", fontWeight: 700, marginBottom: 6 }}>
+          {calib ? "● LIVE MODEL SELF-CALIBRATED" : "○ CALIBRATION PENDING"}
+        </div>
+        {calib ? (
+          <div style={{ fontFamily: C.mono, fontSize: 12, lineHeight: 1.6 }}>
+            Live model removes its own recency-weighted bias (last ~50 games, n={calib.n}), margins & totals <b>separately</b>:<br />
+            · margin: shift <b>{calib.marginFit ? `${calib.marginFit.a >= 0 ? "+" : ""}${calib.marginFit.a.toFixed(1)}` : "—"}</b> pts · spread {calib.marginRMSE?.toFixed(1)}<br />
+            · total: shift <b>{calib.totalFit ? `${calib.totalFit.a >= 0 ? "+" : ""}${calib.totalFit.a.toFixed(1)}` : "—"}</b> pts · spread {calib.totalRMSE?.toFixed(1)}<br />
+            <span style={{ color: C.faint }}>pure mean-bias removal (no scale term) — can't overshoot or invent bias. Tracks scoring-environment drift via the recent window.</span>
+          </div>
+        ) : (
+          <div style={{ fontSize: 12, color: C.faint }}>Needs ≥20 completed games. Once there, the model removes its measured recent bias and sizes its uncertainty to real out-of-sample error — applied to every projection, pick, and probability.</div>
+        )}
+      </div>
+      {res && (
+        <>
+          <div style={{ ...sCard, fontFamily: C.mono, fontSize: 12 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px 16px" }}>
+              <span><span style={{ color: C.faint }}>games tested</span> <b>{res.n}</b></span>
+              <span><span style={{ color: C.faint }}>SU pick acc</span> <b style={{ color: res.suAcc > 0.66 ? C.plus : res.suAcc > 0.6 ? C.warn : C.txt }}>{res.suAcc == null ? "—" : (res.suAcc * 100).toFixed(1) + "%"}</b></span>
+              <span><span style={{ color: C.faint }}>margin MAE</span> <b style={{ color: res.marginMAE < 9.5 ? C.plus : res.marginMAE < 11 ? C.warn : C.minus }}>{f1(res.marginMAE)} pts</b></span>
+              <span><span style={{ color: C.faint }}>total MAE</span> <b style={{ color: res.totalMAE < 11 ? C.plus : res.totalMAE < 13 ? C.warn : C.minus }}>{f1(res.totalMAE)} pts</b></span>
+              <span><span style={{ color: C.faint }}>margin bias (raw)</span> <b style={{ color: Math.abs(res.marginBias) < 1 ? C.plus : C.warn }}>{res.marginBias > 0 ? "+" : ""}{f1(res.marginBias)}</b></span>
+              <span><span style={{ color: C.faint }}>total bias (raw)</span> <b style={{ color: Math.abs(res.totalBias) < 1.5 ? C.plus : C.warn }}>{res.totalBias > 0 ? "+" : ""}{f1(res.totalBias)}</b></span>
+              <span><span style={{ color: C.faint }}>margin bias (corrected)</span> <b style={{ color: res.calMarginBias == null ? C.faint : Math.abs(res.calMarginBias) < 1.2 ? C.plus : C.warn }}>{res.calMarginBias == null ? "—" : (res.calMarginBias > 0 ? "+" : "") + f1(res.calMarginBias)}</b></span>
+              <span><span style={{ color: C.faint }}>total bias (corrected)</span> <b style={{ color: res.calTotalBias == null ? C.faint : Math.abs(res.calTotalBias) < 1.5 ? C.plus : C.warn }}>{res.calTotalBias == null ? "—" : (res.calTotalBias > 0 ? "+" : "") + f1(res.calTotalBias)}</b></span>
+              <span><span style={{ color: C.faint }}>margin RMSE</span> <b>{f1(res.marginRMSE)}</b></span>
+              <span><span style={{ color: C.faint }}>pred/act corr</span> <b style={{ color: res.corr > 0.4 ? C.plus : res.corr > 0.25 ? C.warn : C.minus }}>{res.corr == null ? "—" : res.corr.toFixed(2)}</b></span>
+            </div>
+          </div>
+          <div style={sCard}>
+            <div style={{ fontSize: 11, color: C.faint, letterSpacing: ".06em", marginBottom: 8 }}>WIN-PROBABILITY CALIBRATION (home)</div>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead><tr><th style={{ ...sTh, textAlign: "left" }}>predicted</th><th style={sTh}>actual</th><th style={sTh}>n</th><th style={sTh}>miss</th></tr></thead>
+              <tbody>{res.buckets.map((b, i) => (
+                <tr key={i} style={{ borderTop: `1px solid ${C.line}` }}>
+                  <td style={{ ...sTd, textAlign: "left" }}>{(b.pred * 100).toFixed(0)}%</td>
+                  <td style={sTd}>{(b.act * 100).toFixed(0)}%</td>
+                  <td style={sTd}>{b.n}</td>
+                  <td style={{ ...sTd, color: Math.abs(b.pred - b.act) < 0.08 ? C.plus : Math.abs(b.pred - b.act) < 0.15 ? C.warn : C.minus }}>{((b.pred - b.act) * 100).toFixed(0)}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+            <div style={{ fontSize: 10, color: C.faint, marginTop: 8, lineHeight: 1.5 }}>
+              Reference: a decent WNBA margin model lands ~9–11 MAE; SU accuracy ~65–70%; bias near 0 means no systematic lean. Calibration "miss" near 0 means stated probabilities are honest. These reflect the core engine only — historical injury/rest data isn't reconstructable, so live edges (with availability) should beat these.
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- model picks (ranked recommendations) ---------------- */
+function computePicks(slate, sims, ratings, blendW, minEV) {
+  const picks = [];
+  for (const g of slate) {
+    if (g.state !== "pre") continue;
+    const sim = sims[g.id]; const o = g.odds;
+    if (!sim || !o) continue;
+    const adj = sim.adj || {};
+    const injTotal = (adj.hInjPts || 0) + (adj.aInjPts || 0);
+    const effW = blendW * clamp(1 - injTotal / 16, 0.2, 1);
+    const conf = (ratings?.gp?.[g.home.id] ?? 0) >= 8 && (ratings?.gp?.[g.away.id] ?? 0) >= 8;
+    const sp = o.spread, tt = o.total;
+    const spreadFlag = sp != null && effW * Math.abs(sim.fairSpread - sp) > 5;
+    const totalFlag = tt != null && effW * Math.abs(sim.fairTotal - tt) > 5;
+    const add = (mk, side, label, line, price, modelP, marketP, flag) => {
+      if (price == null || flag) return;
+      const p = marketP != null ? effW * modelP + (1 - effW) * marketP : modelP;
+      const ev = evPct(p, price);
+      if (ev == null || ev < minEV) return;
+      // moneyline guard: longshot ML EV is hypersensitive to tiny win-prob errors, and models are least
+      // accurate at the tails — so a big model-vs-market probability gap is treated as model error, not edge.
+      if (mk === "ml" && marketP != null && effW * Math.abs(modelP - marketP) > 0.045) return;
+      // plausibility ceiling: a ~market-neutral model can't really produce >12% edges — it's model error or stale line.
+      if (ev > 12) return;
+      picks.push({ gid: g.id, game: `${g.away.ab} @ ${g.home.ab}`, time: g.date, desc: `${g.away.ab}@${g.home.ab}`, mk, side, label, line, price, p, ev, kelly: kellyQ(p, price), conf });
+    };
+    if (o.mlH != null && o.mlA != null) {
+      const [mH, mA] = devig2(o.mlH, o.mlA);
+      add("ml", `${g.home.ab} ML`, `${g.home.ab} ML`, null, o.mlH, sim.pHomeML, mH, spreadFlag);
+      add("ml", `${g.away.ab} ML`, `${g.away.ab} ML`, null, o.mlA, 1 - sim.pHomeML, mA, spreadFlag);
+    }
+    if (sp != null) {
+      const spH = o.spH ?? -110, spA = o.spA ?? -110;
+      const [mSH, mSA] = devig2(spH, spA);
+      const pC = sim.pHomeCover(sp);
+      add("spread", `${g.home.ab} ${sp}`, `${g.home.ab} ${sp > 0 ? "+" : ""}${sp}`, sp, spH, pC, mSH, spreadFlag);
+      add("spread", `${g.away.ab} ${-sp}`, `${g.away.ab} ${-sp > 0 ? "+" : ""}${-sp}`, -sp, spA, 1 - pC, mSA, spreadFlag);
+    }
+    if (tt != null) {
+      const tO = o.totO ?? -110, tU = o.totU ?? -110;
+      const [mO, mU] = devig2(tO, tU);
+      const pO = sim.pOver(tt);
+      add("total", `O${tt}`, `Over ${tt}`, tt, tO, pO, mO, totalFlag);
+      add("total", `U${tt}`, `Under ${tt}`, tt, tU, 1 - pO, mU, totalFlag);
+    }
+  }
+  picks.sort((a, b) => b.ev - a.ev);
+  return picks;
+}
+const pickTier = (ev, conf) => (ev >= 3 && conf ? { t: "A", c: "#3fd0a4" } : ev >= 1.5 ? { t: "B", c: "#3fd0a4" } : { t: "C", c: "#e8b452" });
+
+function PicksTab({ slate, sims, ratings, blendW, onLog }) {
+  const [minEV, setMinEV] = useState(1);
+  const picks = useMemo(() => computePicks(slate, sims, ratings, blendW, minEV), [slate, sims, ratings, blendW, minEV]);
+  const top = picks[0];
+  return (
+    <div>
+      <div style={{ ...sCard, padding: 10 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 11, color: C.faint, letterSpacing: ".06em" }}>MIN EV</span>
+          <div style={{ display: "flex", gap: 6 }}>
+            {[["1%", 1], ["2%", 2], ["3%", 3]].map(([l, v]) => (
+              <Btn key={l} small kind={minEV === v ? "primary" : "ghost"} onClick={() => setMinEV(v)}>{l}</Btn>
+            ))}
+          </div>
+        </div>
+      </div>
+      {!slate.length && <div style={{ color: C.faint, fontSize: 13 }}>Sync to load today's slate.</div>}
+      {slate.length > 0 && picks.length === 0 && (
+        <div style={{ ...sCard, textAlign: "center", padding: 22 }}>
+          <div style={{ fontSize: 22, fontWeight: 800, color: C.dim, letterSpacing: ".04em" }}>PASS</div>
+          <div style={{ fontSize: 12, color: C.faint, marginTop: 6 }}>No plays clear +{minEV}% EV after market blend, injury deferral, and deviation filtering. The disciplined move is no bet.</div>
+        </div>
+      )}
+      {top && (
+        <div style={{ ...sCard, border: `1px solid ${C.plus}`, background: "rgba(63,208,164,.06)" }}>
+          <div style={{ fontSize: 10, color: C.plus, letterSpacing: ".1em", fontWeight: 700, marginBottom: 4 }}>★ TOP PICK</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <div><span style={{ fontWeight: 800, fontSize: 16 }}>{top.label}</span> <span style={{ fontFamily: C.mono, fontSize: 13, color: C.dim }}>{fmtA(top.price)}</span></div>
+            <div style={{ fontFamily: C.mono, fontWeight: 800, fontSize: 16, color: C.plus }}>+{top.ev.toFixed(1)}%</div>
+          </div>
+          <div style={{ fontFamily: C.mono, fontSize: 11, color: C.faint, marginTop: 2 }}>{top.game} · model {pct(top.p)} · stake {top.kelly ? top.kelly.toFixed(2) : "—"}u (¼K){!top.conf ? " · thin sample" : ""}</div>
+          <div style={{ marginTop: 8 }}><Btn small kind="primary" onClick={() => onLog({ eventId: top.gid, gameDate: top.time, desc: top.desc, side: top.side, line: top.line, odds: top.price, fairP: top.p })}>log this pick</Btn></div>
+        </div>
+      )}
+      {picks.slice(1).map((p, i) => {
+        const tr = pickTier(p.ev, p.conf);
+        return (
+          <div key={i} style={{ ...sCard, padding: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ minWidth: 0 }}>
+              <div><span style={{ fontWeight: 700, fontSize: 13 }}>{p.label}</span> <span style={{ fontFamily: C.mono, fontSize: 12, color: C.dim }}>{fmtA(p.price)}</span> <span style={{ fontSize: 10, fontFamily: C.mono, fontWeight: 700, color: tr.c, border: `1px solid ${tr.c}`, borderRadius: 4, padding: "0 4px", marginLeft: 4 }}>{tr.t}</span></div>
+              <div style={{ fontFamily: C.mono, fontSize: 10, color: C.faint }}>{p.game} · {pct(p.p)} · {p.kelly ? p.kelly.toFixed(2) : "—"}u{!p.conf ? " · thin" : ""}</div>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontFamily: C.mono, fontWeight: 700, color: C.plus }}>+{p.ev.toFixed(1)}%</span>
+              <Btn small onClick={() => onLog({ eventId: p.gid, gameDate: p.time, desc: p.desc, side: p.side, line: p.line, odds: p.price, fairP: p.p })}>log</Btn>
+            </div>
+          </div>
+        );
+      })}
+      {picks.length > 0 && (
+        <div style={{ fontSize: 10, color: C.faint, marginTop: 4, lineHeight: 1.5 }}>
+          Picks are model-vs-posted-line edges after blending to market, deferring on public injuries, and excluding games where the model deviates &gt;7 pts. Shop each number across your books before firing — a better price only improves the edge.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ---------------- model ledger tab ---------------- */
+function LedgerTab({ ledger }) {
+  const exportCsv = () => {
+    const rows = [["date", "matchup", "market", "side", "open_line", "open_price", "close_line", "clv", "result", "final_score"]];
+    for (const e of Object.values(ledger)) {
+      for (const [mk, m] of Object.entries(e.mkts)) {
+        const clv = mk === "ml" ? mlClvPct(m) : mk === "spread" ? spreadClvPts(m) : totalClvPts(m);
+        rows.push([
+          (e.date || "").slice(0, 10), `${e.away}@${e.home}`, mk, m.side,
+          mk === "ml" ? "" : mk === "spread" ? m.openSp : m.openTot,
+          mk === "ml" ? (m.side === "H" ? m.openH : m.openA) : m.openPrice,
+          mk === "ml" ? (m.side === "H" ? (m.closeH ?? m.lastH) : (m.closeA ?? m.lastA)) : mk === "spread" ? (m.closeSp ?? m.lastSp) : (m.closeTot ?? m.lastTot),
+          clv == null ? "" : clv.toFixed(2), m.result || "", e.score || "",
+        ]);
+      }
+    }
+    const csv = rows.map((r) => r.join(",")).join("\n");
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    a.download = `wnba-sharp-model-ledger-${todayET()}.csv`;
+    a.click();
+  };
+  const entries = Object.values(ledger).sort((a, b) => b.date.localeCompare(a.date));
+  const rows = [];
+  for (const e of entries) for (const [mk, m] of Object.entries(e.mkts)) {
+    const clv = mk === "ml" ? mlClvPct(m) : mk === "spread" ? spreadClvPts(m) : totalClvPts(m);
+    rows.push({ e, mk, m, clv, unit: mk === "ml" ? "%" : "pt" });
+  }
+  const beat = rows.filter((r) => r.clv != null && r.clv > 0.0001).length;
+  const clvN = rows.filter((r) => r.clv != null && (r.e.started || r.e.final)).length;
+  const spreadClvs = rows.filter((r) => r.mk === "spread" && (r.e.started || r.e.final)).map((r) => r.clv);
+  const totalClvs = rows.filter((r) => r.mk === "total" && (r.e.started || r.e.final)).map((r) => r.clv);
+  const mlClvs = rows.filter((r) => r.mk === "ml" && r.clv != null && (r.e.started || r.e.final)).map((r) => r.clv);
+  const settled = rows.filter((r) => r.m.result);
+  const w = settled.filter((r) => r.m.result === "W").length;
+  const l = settled.filter((r) => r.m.result === "L").length;
+  const p = settled.filter((r) => r.m.result === "P").length;
+  const roi = (() => {
+    let u = 0, risk = 0;
+    for (const r of settled) {
+      if (r.m.result === "P") continue;
+      const price = r.mk === "ml" ? (r.m.side === "H" ? r.m.openH : r.m.openA) : r.m.openPrice;
+      risk += 1;
+      u += r.m.result === "W" ? a2d(price) - 1 : -1;
+    }
+    return risk ? (u / risk) * 100 : null;
+  })();
+  const beatRate = clvN ? (beat / clvN) * 100 : null;
+  // CLV by side — does the model's home lean / under lean actually beat the close? (edge) or not (bias)?
+  const seg = (pred) => { const c = rows.filter((r) => (r.e.started || r.e.final) && r.clv != null && pred(r)).map((r) => r.clv); return { avg: c.length ? mean(c) : null, n: c.length }; };
+  const segs = [
+    ["home spreads", seg((r) => r.mk === "spread" && r.m.side === "H"), "pt"],
+    ["away spreads", seg((r) => r.mk === "spread" && r.m.side === "A"), "pt"],
+    ["unders", seg((r) => r.mk === "total" && r.m.side === "U"), "pt"],
+    ["overs", seg((r) => r.mk === "total" && r.m.side === "O"), "pt"],
+  ].filter(([, s]) => s.n > 0);
+  const lab = (mk, m) => mk === "ml" ? `${m.side === "H" ? "home" : "away"} ML` : mk === "spread" ? `${m.side === "H" ? "home" : "away"} spread` : `${m.side === "O" ? "over" : "under"}`;
+  return (
+    <div>
+      <div style={{ ...sCard }}>
+        <div style={{ fontSize: 12, color: C.dim, marginBottom: 10, lineHeight: 1.5 }}>
+          Every slate game's model pick is captured automatically at the price showing when first seen, the line is frozen at tip, and the result is graded against the <b>closing</b> number. No manual entry, no selection bias — this is the model on trial. <b>Beat-close rate &gt;52–55% and positive average CLV is the real proof of an edge.</b>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "8px 16px", fontFamily: C.mono, fontSize: 12 }}>
+          <span><span style={{ color: C.faint }}>positions</span> <b>{rows.length}</b> <span style={{ color: C.faint }}>({clvN} closed)</span> {rows.length > 0 && <Btn small onClick={exportCsv}>export csv</Btn>}</span>
+          <span><span style={{ color: C.faint }}>beat close</span> <b style={{ color: beatRate == null ? C.dim : beatRate >= 55 ? C.plus : beatRate >= 50 ? C.warn : C.minus }}>{beatRate == null ? "—" : beatRate.toFixed(0) + "%"}</b></span>
+          <span><span style={{ color: C.faint }}>spread CLV</span> <b style={{ color: spreadClvs.length && mean(spreadClvs) > 0 ? C.plus : C.txt }}>{spreadClvs.length ? (mean(spreadClvs) > 0 ? "+" : "") + mean(spreadClvs).toFixed(2) + "pt" : "—"}</b></span>
+          <span><span style={{ color: C.faint }}>total CLV</span> <b style={{ color: totalClvs.length && mean(totalClvs) > 0 ? C.plus : C.txt }}>{totalClvs.length ? (mean(totalClvs) > 0 ? "+" : "") + mean(totalClvs).toFixed(2) + "pt" : "—"}</b></span>
+          <span><span style={{ color: C.faint }}>ML CLV</span> <b style={{ color: mlClvs.length && mean(mlClvs) > 0 ? C.plus : C.txt }}>{mlClvs.length ? (mean(mlClvs) > 0 ? "+" : "") + mean(mlClvs).toFixed(1) + "%" : "—"}</b></span>
+          <span><span style={{ color: C.faint }}>vs close</span> <b>{w}-{l}{p ? `-${p}` : ""}</b> <span style={{ color: roi == null ? C.dim : roi >= 0 ? C.plus : C.minus }}>{roi == null ? "" : (roi >= 0 ? "+" : "") + roi.toFixed(1) + "% ROI"}</span></span>
+        </div>
+      </div>
+      {segs.length > 0 && (
+        <div style={{ ...sCard }}>
+          <div style={{ fontSize: 10, color: C.accent, letterSpacing: ".08em", fontWeight: 700, marginBottom: 8 }}>CLV BY SIDE — IS THE LEAN EDGE OR BIAS?</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "6px 16px", fontFamily: C.mono, fontSize: 12 }}>
+            {segs.map(([name, s, u]) => (
+              <span key={name}><span style={{ color: C.faint }}>{name}</span> <b style={{ color: s.avg == null ? C.dim : s.avg > 0.15 ? C.plus : s.avg < -0.15 ? C.minus : C.txt }}>{s.avg == null ? "—" : (s.avg > 0 ? "+" : "") + s.avg.toFixed(2) + u}</b> <span style={{ color: C.faint }}>({s.n})</span></span>
+            ))}
+          </div>
+          <div style={{ fontSize: 11, color: C.faint, marginTop: 8, lineHeight: 1.5 }}>
+            The model leans home and under. If those sides show <b style={{ color: C.plus }}>positive</b> CLV, the lean is real edge — ride it. If <b style={{ color: C.minus }}>negative</b>, it's model bias — fade it. Small samples per side, so weight accordingly.
+          </div>
+        </div>
+      )}
+      {rows.length === 0 && <div style={{ color: C.faint, fontSize: 13 }}>No positions captured yet. Sync with games on the slate and the ledger fills automatically — keep syncing through tip and after finals to record closing lines and results.</div>}
+      {entries.map((e) => (
+        <div key={e.gid} style={{ ...sCard, padding: 10 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+            <span style={{ fontWeight: 700, fontSize: 13 }}>{e.away} @ {e.home}</span>
+            <span style={{ fontFamily: C.mono, fontSize: 11, color: e.final ? C.dim : e.started ? C.warn : C.plus }}>{e.final ? `final ${e.score}` : e.started ? "in progress" : "open"}</span>
+          </div>
+          {Object.entries(e.mkts).map(([mk, m]) => {
+            const clv = mk === "ml" ? mlClvPct(m) : mk === "spread" ? spreadClvPts(m) : totalClvPts(m);
+            const open = mk === "ml" ? `${fmtA(m.side === "H" ? m.openH : m.openA)}` : mk === "spread" ? `${m.openSp > 0 ? "+" : ""}${m.openSp} ${fmtA(m.openPrice)}` : `${m.openTot} ${fmtA(m.openPrice)}`;
+            const close = !e.started ? "—" : mk === "ml" ? `${fmtA(m.side === "H" ? m.closeH ?? m.lastH : m.closeA ?? m.lastA)}` : mk === "spread" ? `${(m.closeSp ?? m.lastSp) > 0 ? "+" : ""}${m.closeSp ?? m.lastSp}` : `${m.closeTot ?? m.lastTot}`;
+            return (
+              <div key={mk} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontFamily: C.mono, fontSize: 11, padding: "3px 0", borderTop: `1px solid ${C.line}` }}>
+                <span style={{ color: C.txt, minWidth: 90 }}>{lab(mk, m)}</span>
+                <span style={{ color: C.faint }}>{open} → {close}</span>
+                <span style={{ color: clv == null ? C.dim : clv > 0 ? C.plus : clv < 0 ? C.minus : C.dim, fontWeight: 700, minWidth: 60, textAlign: "right" }}>
+                  {clv == null || !e.started ? "—" : `${clv > 0 ? "+" : ""}${clv.toFixed(mk === "ml" ? 1 : 2)}${mk === "ml" ? "%" : "pt"}`}
+                </span>
+                <span style={{ fontWeight: 800, minWidth: 18, textAlign: "right", color: m.result === "W" ? C.plus : m.result === "L" ? C.minus : C.dim }}>{m.result || ""}</span>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ---------------- root ---------------- */
+function App() {
+  const [tab, setTab] = useState("picks");
+  const [games, setGames] = useState([]); // completed cache
+  const [slate, setSlate] = useState([]);
+  const [ratings, setRatings] = useState(null);
+  const [lines, setLines] = useState(null);
+  const [live, setLive] = useState(false);
+  const [sync, setSync] = useState({ busy: false, msg: "", last: null, err: null });
+  const [log, setLogState] = useState([]);
+  const [glCache, setGlCache] = useState({});
+  const [injuries, setInjuries] = useState({});
+  const [rosters, setRosters] = useState({}); // teamId -> [{id,name,pos}]
+  const [blendW, setBlendW] = useState(0.6);   // model weight; remainder = market weight
+  const [srProxy, setSrProxy] = useState("");
+  const [injStatus, setInjStatus] = useState(null);
+  const [ledger, setLedger] = useState({});     // auto CLV-vs-close ledger
+  const [calib, setCalib] = useState(null);     // self-calibration from walk-forward backtest
+  const [propsGame, setPropsGame] = useState(null);
+
+  const adjustments = useMemo(() => {
+    const m = {};
+    for (const g of slate) m[g.id] = gameAdjustments(g, ratings, glCache, injuries, rosters, games);
+    return m;
+  }, [slate, ratings, glCache, injuries, rosters, games]);
+
+  const sims = useMemo(() => {
+    if (!ratings) return {};
+    const m = {};
+    for (const g of slate) { const s = simGame(ratings, g.home.id, g.away.id, adjustments[g.id] || {}, calib); if (s) m[g.id] = s; }
+    return m;
+  }, [slate, ratings, adjustments, calib]);
+
+  // self-calibration: recompute the model's out-of-sample error whenever the game set changes
+  useEffect(() => {
+    if (!games.length) return;
+    const finals = games.filter((g) => g.hPts != null && g.hPoss && g.aPoss).length;
+    if (finals < 30) { setCalib(null); return; }
+    const id = setTimeout(() => {
+      const bt = runBacktest(games);
+      if (bt && bt.n >= 20) {
+        const c = { marginFit: bt.marginFit, totalFit: bt.totalFit, marginBias: bt.marginBias, totalBias: bt.totalBias, calMarginBias: bt.calMarginBias, calTotalBias: bt.calTotalBias, marginRMSE: bt.marginRMSE, totalRMSE: bt.totalRMSE, n: bt.n, ts: Date.now() };
+        setCalib(c); store.set(K_CALIB, c);
+      }
+    }, 50);
+    return () => clearTimeout(id);
+  }, [games]);
+
+  const setLog = (fn) => setLogState((L) => { const n = typeof fn === "function" ? fn(L) : fn; store.set(K_LOG, n); return n; });
+
+  useEffect(() => {
+    (async () => {
+      const [g, l, gl, rs, ld] = await Promise.all([store.get(K_GAMES), store.get(K_LOG), store.get(K_GL), store.get(K_ROSTERS), store.get(K_LEDGER)]);
+      if (g?.games) { setGames(g.games); const rt = buildRatings(g.games); setRatings(rt); }
+      if (l) setLogState(l);
+      if (gl) setGlCache(gl);
+      if (rs) setRosters(rs);
+      if (ld) setLedger(ld);
+      const cb = await store.get(K_CALIB); if (cb) setCalib(cb);
+      const sp = await store.get(K_SRPROXY); if (sp) setSrProxy(sp);
+    })();
+  }, []);
+
+  // auto-capture model picks + closing lines + results for every slate game (unbiased)
+  useEffect(() => {
+    if (!slate.length) return;
+    setLedger((prev) => updateLedger(prev, slate, sims));
+  }, [slate, sims]);
+  // settle ledger from the completed-games cache — grades games even after they leave the slate
+  useEffect(() => {
+    if (!games.length) return;
+    setLedger((prev) => settleLedgerFromGames(prev, games));
+  }, [games]);
+  useEffect(() => {
+    if (Object.keys(ledger).length) store.set(K_LEDGER, ledger);
+  }, [ledger]);
+
+  const runSync = useCallback(async () => {
+    setSync({ busy: true, msg: "calendar…", last: null, err: null });
+    try {
+      const cached = (await store.get(K_GAMES)) || { games: [], lastDate: null };
+      const today = todayET();
+      const tomorrow = addDaysYmd(today, 1);
+      const from = cached.lastDate ? cached.lastDate : SEASON_START.replace(/-/g, "");
+      // ESPN's own league calendar drives the date list — no missed game dates, no wasted calls
+      const probe = await fjson(SB_URL(today));
+      const cal = (probe.leagues?.[0]?.calendar || [])
+        .map((c) => ymdET(typeof c === "string" ? c : c.startDate || c))
+        .filter((d) => d >= from && d <= tomorrow);
+      const dates = [...new Set([...(cal.length ? cal : dateRange(from, today)), today, tomorrow])].sort();
+      const sbs = await pool(dates, 6, (d) => fjson(SB_URL(d)), (d, t) => setSync((s) => ({ ...s, msg: `scoreboards ${d}/${t}` })));
+      const failed = sbs.filter((x) => x == null).length;
+      const byId = Object.fromEntries(cached.games.map((g) => [g.id, g]));
+      const slateEvts = {};
+      const needBox = [];
+      for (let i = 0; i < sbs.length; i++) {
+        for (const ev of sbs[i]?.events || []) {
+          const pe = parseScoreboardEvent(ev);
+          if (!isModelGame(pe)) continue;
+          if (pe.d >= today) slateEvts[pe.id] = pe;
+          // fetch box for new finals AND retry any cached game whose box never parsed
+          const existing = byId[pe.id];
+          if (pe.completed && (!existing || existing.hPoss == null || existing.aPoss == null)) needBox.push(pe);
+        }
+      }
+      setSync((s) => ({ ...s, msg: `box scores 0/${needBox.length}` }));
+      const sums = await pool(needBox, 5, (g) => fjson(SUM_URL(g.id)), (d, t) => setSync((s) => ({ ...s, msg: `box scores ${d}/${t}` })));
+      needBox.forEach((g, i) => {
+        let hPoss = null, aPoss = null;
+        const bt = sums[i]?.boxscore?.teams;
+        if (bt) for (const t of bt) {
+          const poss = teamPossFromBox(t.statistics || []);
+          if (String(t.team.id) === String(g.home.id)) hPoss = poss; else aPoss = poss;
+        }
+        byId[g.id] = { id: g.id, date: g.date, d: g.d, hId: g.home.id, hAb: g.home.ab, hPts: g.home.pts, aId: g.away.id, aAb: g.away.ab, aPts: g.away.pts, hPoss, aPoss };
+      });
+      const allGames = Object.values(byId).sort((a, b) => a.date.localeCompare(b.date));
+      // lastDate = today (not tomorrow) so tonight's finals are re-checked on the next sync
+      if (failed === 0) await store.set(K_GAMES, { games: allGames, lastDate: today });
+      setGames(allGames);
+      setRatings(buildRatings(allGames));
+      const slateArr = Object.values(slateEvts).sort((a, b) => a.date.localeCompare(b.date));
+      // enrich with real american juice from the fuller odds endpoint (fill-only; never breaks lines)
+      setSync((s) => ({ ...s, msg: "odds prices…" }));
+      await pool(slateArr, 4, async (ge) => {
+        try {
+          const j = await fjson(ODDS_URL(ge.id));
+          const real = parseEventOdds(j);
+          if (real && ge.odds) {
+            for (const k of ["mlH", "mlA", "spH", "spA", "totO", "totU"]) {
+              if (ge.odds[k] == null && real[k] != null) ge.odds[k] = real[k]; // fill assumed -110 with real price
+            }
+          } else if (real && !ge.odds) {
+            ge.odds = { spread: real.spread, total: real.total, mlH: real.mlH, mlA: real.mlA, spH: real.spH, spA: real.spA, totO: real.totO, totU: real.totU, provider: real.provider };
+          }
+        } catch (e) { /* keep scoreboard odds */ }
+      });
+      setSlate(slateArr);
+      setLines(new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }));
+      try {
+        const ij = await fjson(INJ_URL);
+        const map = {};
+        for (const t of ij.injuries || []) for (const inj of t.injuries || []) {
+          const nm = inj.athlete?.displayName; if (nm) map[normName(nm)] = { status: normStatus(inj.status || inj.type?.description || "listed"), src: "ESPN" };
+        }
+        // SportRadar overlay (higher quality) via secure proxy, if configured
+        let srCount = 0;
+        const proxy = await store.get(K_SRPROXY);
+        if (proxy) {
+          try {
+            const srJson = await fjson(proxy);
+            const srMap = parseSRInjuries(srJson);
+            srCount = Object.keys(srMap).length;
+            Object.assign(map, srMap); // SR wins on conflicts
+          } catch (e) { srCount = -1; /* proxy unreachable */ }
+        }
+        setInjuries(map);
+        setInjStatus({ espn: Object.values(map).filter((v) => v.src === "ESPN").length, sr: srCount });
+      } catch (e) { /* injury feed optional */ }
+      // rosters + game logs for slate teams -> enables injury-adjusted team strength in the game model
+      try {
+        const slateGames = Object.values(slateEvts);
+        const teamIds = [...new Set(slateGames.flatMap((g) => [g.home.id, g.away.id]))];
+        if (teamIds.length) {
+          setSync((s) => ({ ...s, msg: `rosters 0/${teamIds.length}` }));
+          const rCache = (await store.get(K_ROSTERS)) || {};
+          let rd = 0;
+          const ros = await pool(teamIds, 4, async (tid) => {
+            const j = await fjson(ROSTER_URL(tid));
+            let ath = j.athletes || [];
+            if (ath.length && ath[0].items) ath = ath.flatMap((x) => x.items);
+            rd++; setSync((s) => ({ ...s, msg: `rosters ${rd}/${teamIds.length}` }));
+            return ath.map((a) => ({ id: a.id, name: a.fullName || a.displayName, pos: a.position?.abbreviation || null }));
+          });
+          const rmap = { ...rCache };
+          teamIds.forEach((tid, i) => { if (ros[i]) rmap[tid] = ros[i]; });
+          setRosters(rmap); await store.set(K_ROSTERS, rmap);
+          const todayISO = new Date().toISOString().slice(0, 10);
+          const glc = { ...(await store.get(K_GL)) };
+          const players = teamIds.flatMap((tid) => rmap[tid] || []);
+          const need = players.filter((p) => !glc[p.id] || glc[p.id].d !== todayISO);
+          let gd = 0;
+          await pool(need, 6, async (p) => {
+            try { const j = await fjson(GL_URL(p.id)); glc[p.id] = { d: todayISO, gl: parseGamelog(j) }; }
+            catch (e) { glc[p.id] = { d: todayISO, gl: [] }; }
+            gd++; setSync((s) => ({ ...s, msg: `player logs ${gd}/${need.length}` }));
+          });
+          setGlCache(glc); await store.set(K_GL, glc);
+        }
+      } catch (e) { /* injury-adjustment falls back to 0; flagged in UI */ }
+      setSync({
+        busy: false, msg: "",
+        last: new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }),
+        err: failed > 0 ? `${failed} scoreboard date(s) failed to load — cache checkpoint NOT advanced, so nothing is silently missing. Sync again.` : null,
+      });
+    } catch (e) {
+      setSync({ busy: false, msg: "", last: null, err: "Sync failed — ESPN feed unreachable. No estimated data was substituted." });
+    }
+  }, []);
+
+  // lightweight line refresh: re-pulls today + tomorrow scoreboards only (2 calls)
+  const refreshLines = useCallback(async () => {
+    try {
+      const t = todayET(), tm = addDaysYmd(t, 1);
+      const sbs = await Promise.all([fjson(SB_URL(t)), fjson(SB_URL(tm))]);
+      const evts = {};
+      for (const sb of sbs) for (const ev of sb.events || []) {
+        const pe = parseScoreboardEvent(ev);
+        if (isModelGame(pe) && pe.d >= t) evts[pe.id] = pe;
+      }
+      setSlate(Object.values(evts).sort((a, b) => a.date.localeCompare(b.date)));
+      setLines(new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" }));
+    } catch (e) { /* keep last known lines */ }
+  }, []);
+
+  useEffect(() => {
+    if (!live) return;
+    const id = setInterval(() => { if (document.visibilityState === "visible") refreshLines(); }, 90000);
+    return () => clearInterval(id);
+  }, [live, refreshLines]);
+
+  const addBet = (b) => {
+    const stake = b.fairP != null && b.odds != null ? Math.max(0.25, Math.round((kellyQ(b.fairP, b.odds) || 1) * 4) / 4) : 1;
+    setLog((L) => [...L, { ...b, id: Date.now() + Math.random(), ts: new Date().toISOString(), stake, result: null, clv: null }]);
+  };
+
+  const tabs = [
+    ["picks", "Picks"], ["slate", "Slate"], ["ratings", "Ratings"], ["props", "Props"], ["validate", "Validate"], ["model", "Model"], ["log", `Log${log.length ? ` (${log.length})` : ""}`],
+  ];
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, color: C.txt, fontFamily: C.sans, padding: "14px 12px 60px" }}>
+      <div style={{ maxWidth: 720, margin: "0 auto" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <div>
+            <div style={{ fontWeight: 800, fontSize: 17, letterSpacing: "-0.01em" }}>WNBA SHARP <span style={{ color: C.accent }}>{SEASON}</span> <span style={{ fontSize: 10, color: C.plus, fontFamily: C.mono, fontWeight: 700, border: `1px solid ${C.plus}`, borderRadius: 4, padding: "1px 5px", verticalAlign: "middle" }}>build 25 · clv-segments</span></div>
+            <div style={{ fontSize: 10, color: C.faint, fontFamily: C.mono }}>
+              {games.length ? `${games.length} games synced` : "no data yet"}{sync.last ? ` · synced ${sync.last}` : ""}
+            </div>
+          </div>
+          <Btn kind="primary" onClick={runSync} disabled={sync.busy}>{sync.busy ? sync.msg || "syncing…" : "Sync"}</Btn>
+        </div>
+        {sync.err && <div style={{ ...sCard, color: C.minus, fontSize: 12 }}>{sync.err}</div>}
+        <div style={{ display: "flex", gap: 6, marginBottom: 12, overflowX: "auto" }}>
+          {tabs.map(([k, l]) => (
+            <button key={k} onClick={() => setTab(k)} style={{
+              border: "none", borderBottom: tab === k ? `2px solid ${C.accent}` : "2px solid transparent",
+              background: "transparent", color: tab === k ? C.txt : C.dim, fontWeight: 700, fontSize: 13, padding: "6px 10px", cursor: "pointer", whiteSpace: "nowrap",
+            }}>{l}</button>
+          ))}
+        </div>
+
+        {tab === "slate" && (
+          <div>
+            {!games.length && !sync.busy && (
+              <div style={sCard}>
+                <div style={{ fontSize: 13, lineHeight: 1.5 }}>
+                  Tap <b>Sync</b>. It pulls every {SEASON} result + box score from ESPN, builds opponent-adjusted per-100 ratings and pace, then runs 10k-sim Monte Carlo on today's slate against the posted market (devigged multiplicatively). All persistent — next sync only fetches new games.
+                </div>
+              </div>
+            )}
+            {slate.length === 0 && games.length > 0 && !sync.busy && <div style={{ color: C.faint, fontSize: 13 }}>No games today or tomorrow per ESPN's league calendar.</div>}
+            {slate.length > 0 && (
+              <div style={{ ...sCard, padding: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <span style={{ fontSize: 10, color: C.faint, fontFamily: C.mono }}>{lines ? `lines as of ${lines}` : ""}</span>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <Btn small onClick={refreshLines}>refresh lines</Btn>
+                    <Btn small kind={live ? "primary" : "ghost"} onClick={() => setLive(!live)}>{live ? "live: on" : "live: off"}</Btn>
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 10, color: C.faint, letterSpacing: ".06em" }}>BELIEF</span>
+                  {[["Model", 1], ["Blend", 0.6], ["Market", 0]].map(([lbl, w]) => (
+                    <Btn key={lbl} small kind={Math.abs(blendW - w) < 0.01 ? "primary" : "ghost"} onClick={() => setBlendW(w)}>{lbl}</Btn>
+                  ))}
+                  <span style={{ fontSize: 10, color: C.faint, fontFamily: C.mono }}>
+                    {blendW === 1 ? "pure model" : blendW === 0 ? "pure no-vig market" : `${Math.round(blendW * 100)}% model / ${Math.round((1 - blendW) * 100)}% market`}
+                  </span>
+                </div>
+                <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", marginTop: 8, paddingTop: 8, borderTop: `1px solid ${C.line}` }}>
+                  <span style={{ fontSize: 10, color: C.faint, letterSpacing: ".06em" }}>INJURIES</span>
+                  <input value={srProxy} onChange={(e) => setSrProxy(e.target.value)} placeholder="SportRadar proxy URL (optional)"
+                    style={{ flex: 1, minWidth: 160, background: C.panel2, border: `1px solid ${C.line}`, borderRadius: 6, color: C.txt, fontFamily: C.mono, fontSize: 11, padding: "5px 7px" }} />
+                  <Btn small kind="primary" onClick={() => { store.set(K_SRPROXY, srProxy.trim()); }}>save</Btn>
+                  <span style={{ fontSize: 10, color: C.faint, fontFamily: C.mono }}>
+                    {injStatus == null ? "ESPN feed" : `ESPN ${injStatus.espn}${injStatus.sr > 0 ? ` · SR ${injStatus.sr} ✓` : injStatus.sr === -1 ? " · SR proxy unreachable" : ""}`}
+                  </span>
+                </div>
+              </div>
+            )}
+            <SlateLean slate={slate} sims={sims} />
+            {[["TODAY", slate.filter((g) => g.d === todayET())], ["TOMORROW", slate.filter((g) => g.d > todayET())]].map(([lbl, gs]) => gs.length > 0 && (
+              <div key={lbl}>
+                <div style={{ fontSize: 10, color: C.accent, letterSpacing: ".1em", fontWeight: 700, margin: "10px 0 6px" }}>{lbl} · {gs.length} GAME{gs.length > 1 ? "S" : ""}</div>
+                {gs.map((g) => g.state !== "pre" ? (
+                  <div key={g.id} style={{ ...sCard, padding: 10, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <span style={{ fontSize: 13, fontWeight: 700 }}>{g.away.ab} {g.away.pts ?? ""} — {g.home.pts ?? ""} {g.home.ab}</span>
+                    <span style={{ fontFamily: C.mono, fontSize: 11, color: g.completed ? C.dim : C.plus, fontWeight: 700 }}>{g.completed ? "FINAL" : `LIVE · ${g.statusTxt}`}</span>
+                  </div>
+                ) : (
+                  <GameCard key={g.id} g={g} sim={sims[g.id]} ratings={ratings} blendW={blendW} ledgerEntry={ledger[g.id]} onLogBet={addBet}
+                    onOpenProps={(gm) => { setPropsGame(gm); setTab("props"); }} />
+                ))}
+              </div>
+            ))}
+          </div>
+        )}
+        {tab === "picks" && <PicksTab slate={slate} sims={sims} ratings={ratings} blendW={blendW} onLog={addBet} />}
+        {tab === "ratings" && <RatingsTab ratings={ratings} games={games} />}
+        {tab === "validate" && <ValidationTab games={games} calib={calib} />}
+        {tab === "model" && <LedgerTab ledger={ledger} />}
+        {tab === "props" && (
+          propsGame ? (
+            <div>
+              <div style={{ display: "flex", gap: 6, marginBottom: 10, overflowX: "auto" }}>
+                {slate.map((g) => (
+                  <Btn key={g.id} small kind={propsGame.id === g.id ? "primary" : "ghost"} onClick={() => setPropsGame(g)}>{g.away.ab}@{g.home.ab}</Btn>
+                ))}
+              </div>
+              <PropsPanel key={propsGame.id} game={propsGame} ratings={ratings} gamelogCache={glCache} setGamelogCache={setGlCache} injuries={injuries} />
+            </div>
+          ) : (
+            <div style={{ color: C.faint, fontSize: 13 }}>{slate.length ? "Pick a game:" : "Sync first — props load per game from the slate."}
+              <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+                {slate.map((g) => <Btn key={g.id} small onClick={() => setPropsGame(g)}>{g.away.ab}@{g.home.ab}</Btn>)}
+              </div>
+            </div>
+          )
+        )}
+        {tab === "log" && <LogTab log={log} setLog={setLog} />}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+</script></body></html>
